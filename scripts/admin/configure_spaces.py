@@ -1,21 +1,24 @@
 from __future__ import annotations
 
 import json
-import os
+import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
-from dotenv import load_dotenv
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from app.config import PROJECT_DIR, project_path, settings, video_source_from_env  # noqa: E402
 
 
-SCRIPT_DIR = Path(__file__).resolve().parent.parent
-PROJECT_DIR = SCRIPT_DIR.parent
 IMAGE_PATH = PROJECT_DIR / "imagenes" / "imagen10.jpg"
-OUTPUT_PATH = SCRIPT_DIR / "estacionamientos.json"
-load_dotenv(PROJECT_DIR / ".env")
-CALIBRATION_IMAGE = os.getenv("CALIBRATION_IMAGE", str(IMAGE_PATH))
-VIDEO_SOURCE = os.getenv("VIDEO_SOURCE", "")
+# Se guarda donde el servicio lo va a leer (PARKING_CELLS).
+OUTPUT_PATH = settings.cells_path
+CALIBRATION_IMAGE = str(project_path("CALIBRATION_IMAGE", IMAGE_PATH))
+VIDEO_SOURCE = video_source_from_env("")
+# Backspace, DEL (macOS), Supr en Windows y Supr en Linux.
+DELETE_KEYS = (8, 127, 3014656, 65535)
 
 points: list[list[int]] = []
 spaces: dict[str, list[list[int]]] = {}
@@ -79,6 +82,17 @@ def scaled_spaces(target_size: tuple[int, int] | None) -> dict[str, list[list[in
     target_width, target_height = target_size
     scale_x = target_width / source_width
     scale_y = target_height / source_height
+    print(
+        f"Re-escalando de {source_width}x{source_height} (imagen) "
+        f"a {target_width}x{target_height} (video)."
+    )
+    # Si la proporción cambia, la imagen no tiene el mismo encuadre que el video
+    # y las celdas quedarían deformadas.
+    if abs(source_width / source_height - target_width / target_height) > 0.02:
+        print(
+            "ADVERTENCIA: la imagen y el video no tienen la misma proporción. "
+            "Verifica que la imagen tenga exactamente el mismo encuadre."
+        )
     return {
         name: [[round(x * scale_x), round(y * scale_y)] for x, y in space_points]
         for name, space_points in spaces.items()
@@ -91,7 +105,7 @@ def draw_space(event: int, x: int, y: int, flags: int, param: object) -> None:
     if event == cv2.EVENT_RBUTTONDOWN:
         selected_space = find_space_at(x, y)
         if selected_space:
-            print(f"{selected_space} seleccionada. Presiona Delete para borrarla.")
+            print(f"{selected_space} seleccionada. Presiona Supr o Backspace para borrarla.")
         else:
             print("No hay una celda en ese punto.")
         redraw()
@@ -133,8 +147,6 @@ def main() -> None:
             raise RuntimeError(
                 f"No se pudo capturar un cuadro de VIDEO_SOURCE: {VIDEO_SOURCE}"
             )
-    else:
-        image = cv2.imread(str(IMAGE_PATH))
 
     if image is None:
         raise FileNotFoundError(
@@ -148,17 +160,24 @@ def main() -> None:
     cv2.setMouseCallback(window, draw_space)
     print(
         "Clic izquierdo: marcar puntos | clic derecho: seleccionar celda | "
-        "Delete: borrar | Z: deshacer | R: limpiar puntos | S: guardar | ESC: salir"
+        "Supr/Backspace: borrar | Z: deshacer | R: limpiar puntos | S: guardar | ESC: salir"
     )
 
     while True:
         cv2.imshow(window, canvas)
-        key = cv2.waitKey(20) & 0xFF
+        # waitKeyEx permite distinguir la tecla Supr, que en Windows devuelve 3014656.
+        key = cv2.waitKeyEx(20)
         if key in (ord("s"), ord("S")):
             if not spaces:
                 print("No hay espacios para guardar.")
                 continue
-            output_spaces = scaled_spaces(video_dimensions())
+            dimensions = video_dimensions()
+            if dimensions is None:
+                print(
+                    "ADVERTENCIA: no se pudo leer VIDEO_SOURCE; las coordenadas se "
+                    "guardan sin re-escalar, en el tamaño de la imagen."
+                )
+            output_spaces = scaled_spaces(dimensions)
             with OUTPUT_PATH.open("w", encoding="utf-8") as file:
                 json.dump(output_spaces, file, indent=4)
             print(f"Configuración guardada en {OUTPUT_PATH}")
@@ -175,7 +194,7 @@ def main() -> None:
                 redraw()
             else:
                 print("No hay celdas para deshacer.")
-        if key in (8, 127):
+        if key in DELETE_KEYS:
             if selected_space and selected_space in spaces:
                 del spaces[selected_space]
                 print(f"{selected_space} eliminada")

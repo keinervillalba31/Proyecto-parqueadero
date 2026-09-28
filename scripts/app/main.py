@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import asyncio
-import shutil
-import tempfile
+import time
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import Any
 
+import cv2
+import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 
 from .config import settings
 from .video_service import VideoService
 
+
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 
 service = VideoService(settings)
 
@@ -41,7 +43,7 @@ def state() -> dict[str, Any]:
 def spaces_state() -> dict[str, Any]:
     current = service.state.snapshot()
     return {
-        key: current[key]
+        key: current.get(key)
         for key in (
             "timestamp",
             "total_celdas",
@@ -50,6 +52,7 @@ def spaces_state() -> dict[str, Any]:
             "vehiculos_detectados",
             "congestion_porcentaje",
             "celdas",
+            "reservas",
         )
     }
 
@@ -59,44 +62,42 @@ def plates_state() -> dict[str, Any]:
     return service.state.snapshot().get("placa", {})
 
 
+@app.get("/reservas")
+def reservations() -> dict[str, Any]:
+    return service.state.snapshot().get("reservas", {})
+
+
 @app.post("/vision/license-plates")
 def read_license_plates(image: UploadFile = File(...)) -> dict[str, Any]:
     if not image.content_type or not image.content_type.startswith("image/"):
         raise HTTPException(status_code=415, detail="El archivo debe ser una imagen")
 
-    temporary_path: str | None = None
-    try:
-        suffix = Path(image.filename or "").suffix or ".jpg"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temporary:
-            shutil.copyfileobj(image.file, temporary)
-            temporary_path = temporary.name
-        import cv2
+    content = image.file.read(MAX_UPLOAD_BYTES + 1)
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="La imagen supera los 10 MB")
 
-        frame = cv2.imread(temporary_path)
-        if frame is None:
-            raise HTTPException(status_code=415, detail="No se pudo leer la imagen")
+    frame = cv2.imdecode(np.frombuffer(content, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if frame is None:
+        raise HTTPException(status_code=415, detail="No se pudo leer la imagen")
+
+    try:
         plate = service.plates.read(frame)
-        return {"plate": plate, "registered": plate in service.registered_vehicles if plate else False}
-    except HTTPException:
-        raise
     except Exception as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
-    finally:
-        if temporary_path:
-            Path(temporary_path).unlink(missing_ok=True)
+    return {"plate": plate, "registered": plate in service.registered_vehicles if plate else False}
 
 
 @app.get("/video")
 def video_stream() -> StreamingResponse:
     def frames():
+        last_id = -1
         while True:
-            frame = service.state.get_frame()
-            if frame is not None:
+            frame_id, frame = service.state.get_frame()
+            # Solo se envía el cuadro cuando el hilo de video produjo uno nuevo.
+            if frame is not None and frame_id != last_id:
+                last_id = frame_id
                 yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
-            await_seconds = 0.04
-            import time
-
-            time.sleep(await_seconds)
+            time.sleep(0.04)
 
     return StreamingResponse(
         frames(), media_type="multipart/x-mixed-replace; boundary=frame"

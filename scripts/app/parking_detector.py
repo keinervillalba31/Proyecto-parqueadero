@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -14,104 +15,54 @@ from ultralytics import YOLO
 VEHICLE_CLASSES = {2: "Carro", 3: "Moto", 5: "Bus", 7: "Camion"}
 
 
-class ParkingDetector:
+@dataclass
+class Vehicle:
+    class_id: int
+    confidence: float
+    box: tuple[int, int, int, int]
+    # True si el vehículo está dentro de una celda (estacionado).
+    in_cell: bool = False
+
+    @property
+    def area(self) -> int:
+        x1, y1, x2, y2 = self.box
+        return (x2 - x1) * (y2 - y1)
+
+    @property
+    def footpoint(self) -> Point:
+        x1, _, x2, y2 = self.box
+        return Point((x1 + x2) / 2, y2)
+
+
+class VehicleDetector:
+    """Detecta vehículos con YOLO, analizando también recortes del cuadro."""
+
     def __init__(
         self,
-        cells_path: Path,
         model_path: Path,
         confidence: float,
         image_size: int,
         tile_grid: int,
-        coverage_threshold: float,
         minimum_box_area: int,
         minimum_motorcycle_area: int,
     ) -> None:
-        with cells_path.open("r", encoding="utf-8") as file:
-            parking_cells = json.load(file)
-
-        self.cells = {
-            name: {
-                "points": np.array(points, dtype=np.int32),
-                "polygon": Polygon(points),
-            }
-            for name, points in parking_cells.items()
-        }
         self.model = YOLO(str(model_path))
         self.confidence = confidence
         self.image_size = image_size
         self.tile_grid = max(tile_grid, 1)
-        self.coverage_threshold = coverage_threshold
         self.minimum_box_area = minimum_box_area
         self.minimum_motorcycle_area = minimum_motorcycle_area
 
-    def detect(self, frame: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
-        occupied = {name: False for name in self.cells}
-        detected_vehicles = 0
-        detections = self._detect_with_tiles(frame)
-
-        for class_id, confidence, coordinates in detections:
-            x1, y1, x2, y2 = coordinates
+    def detect(self, frame: np.ndarray) -> list[Vehicle]:
+        vehicles = []
+        for class_id, confidence, box in self._detect_with_tiles(frame):
+            vehicle = Vehicle(class_id, confidence, box)
             minimum_area = (
-                self.minimum_motorcycle_area
-                if class_id == 3
-                else self.minimum_box_area
+                self.minimum_motorcycle_area if class_id == 3 else self.minimum_box_area
             )
-            if (x2 - x1) * (y2 - y1) < minimum_area:
-                continue
-
-            detected_vehicles += 1
-            vehicle_footpoint = Point((x1 + x2) / 2, y2)
-            label = VEHICLE_CLASSES[class_id]
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 0), 2)
-            cv2.putText(
-                frame,
-                label,
-                (x1, max(y1 - 8, 15)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (255, 255, 0),
-                2,
-            )
-
-            for name, cell in self.cells.items():
-                if cell["polygon"].covers(vehicle_footpoint):
-                    occupied[name] = True
-
-        for name, cell in self.cells.items():
-            is_occupied = occupied[name]
-            color = (0, 0, 255) if is_occupied else (0, 255, 0)
-            status = "Ocupado" if is_occupied else "Libre"
-            points = cell["points"]
-            cv2.polylines(frame, [points], True, color, 2)
-            cv2.putText(
-                frame,
-                f"{name}: {status}",
-                tuple(points[0] + np.array([0, -8])),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                color,
-                2,
-            )
-
-        occupied_count = sum(occupied.values())
-        state = {
-            "timestamp": time.time(),
-            "total_celdas": len(self.cells),
-            "ocupadas": occupied_count,
-            "libres": len(self.cells) - occupied_count,
-            "vehiculos_detectados": detected_vehicles,
-            "congestion_porcentaje": round(occupied_count / len(self.cells) * 100, 2)
-            if self.cells
-            else 0.0,
-            "celdas": {
-                name: {
-                    "ocupado": is_occupied,
-                    "estado": "ocupado" if is_occupied else "libre",
-                }
-                for name, is_occupied in occupied.items()
-            },
-        }
-        return frame, state
+            if vehicle.area >= minimum_area:
+                vehicles.append(vehicle)
+        return vehicles
 
     def _detect_with_tiles(
         self, frame: np.ndarray
@@ -123,8 +74,8 @@ class ParkingDetector:
         if self.tile_grid > 1:
             tile_width = min(width, int(width / self.tile_grid * 1.35))
             tile_height = min(height, int(height / self.tile_grid * 1.35))
-            x_starts = sorted({0, max(width - tile_width, 0)})
-            y_starts = sorted({0, max(height - tile_height, 0)})
+            x_starts = self._tile_starts(width, tile_width)
+            y_starts = self._tile_starts(height, tile_height)
             sources.extend(
                 (frame[y : y + tile_height, x : x + tile_width], x, y)
                 for y in y_starts
@@ -151,6 +102,8 @@ class ParkingDetector:
                     )
                 )
 
+        if not candidates:
+            return []
         boxes = [[x1, y1, x2 - x1, y2 - y1] for _, _, (x1, y1, x2, y2) in candidates]
         kept = cv2.dnn.NMSBoxes(
             boxes,
@@ -159,6 +112,135 @@ class ParkingDetector:
             0.45,
         )
         return [candidates[index] for index in np.array(kept).flatten()]
+
+    def _tile_starts(self, length: int, tile_length: int) -> list[int]:
+        """Reparte `tile_grid` recortes solapados a lo largo de un eje."""
+        last = max(length - tile_length, 0)
+        return sorted(
+            {round(last * index / (self.tile_grid - 1)) for index in range(self.tile_grid)}
+        )
+
+
+class ParkingDetector:
+    def __init__(
+        self,
+        cells_path: Path,
+        model_path: Path,
+        confidence: float,
+        image_size: int,
+        tile_grid: int,
+        minimum_box_area: int,
+        minimum_motorcycle_area: int,
+        occupancy_frames: int = 1,
+    ) -> None:
+        with cells_path.open("r", encoding="utf-8") as file:
+            parking_cells = json.load(file)
+
+        self.cells = {
+            name: {
+                "points": np.array(points, dtype=np.int32),
+                "polygon": Polygon(points),
+            }
+            for name, points in parking_cells.items()
+        }
+        self.vehicles = VehicleDetector(
+            model_path=model_path,
+            confidence=confidence,
+            image_size=image_size,
+            tile_grid=tile_grid,
+            minimum_box_area=minimum_box_area,
+            minimum_motorcycle_area=minimum_motorcycle_area,
+        )
+        # Vehículos del último cuadro, para recortarlos y leer sus placas.
+        self.last_vehicles: list[Vehicle] = []
+        # Un cambio de estado solo se acepta si se repite en varios cuadros
+        # seguidos; así una detección perdida no hace parpadear la celda.
+        self.occupancy_frames = max(occupancy_frames, 1)
+        self.stable_occupied = {name: False for name in self.cells}
+        self.pending_frames = {name: 0 for name in self.cells}
+
+    def _smooth(self, raw_occupied: dict[str, bool]) -> dict[str, bool]:
+        for name, is_occupied in raw_occupied.items():
+            if is_occupied == self.stable_occupied[name]:
+                self.pending_frames[name] = 0
+                continue
+            self.pending_frames[name] += 1
+            if self.pending_frames[name] >= self.occupancy_frames:
+                self.stable_occupied[name] = is_occupied
+                self.pending_frames[name] = 0
+        return dict(self.stable_occupied)
+
+    def detect(
+        self, frame: np.ndarray, reserved: dict[str, str] | None = None
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        reserved = reserved or {}
+        occupied = {name: False for name in self.cells}
+        vehicles = self.vehicles.detect(frame)
+
+        for vehicle in vehicles:
+            x1, y1, x2, y2 = vehicle.box
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 0), 2)
+            cv2.putText(
+                frame,
+                VEHICLE_CLASSES[vehicle.class_id],
+                (x1, max(y1 - 8, 15)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 0),
+                2,
+            )
+
+            for name, cell in self.cells.items():
+                if cell["polygon"].covers(vehicle.footpoint):
+                    occupied[name] = True
+                    vehicle.in_cell = True
+
+        self.last_vehicles = vehicles
+        occupied = self._smooth(occupied)
+
+        for name, cell in self.cells.items():
+            is_occupied = occupied[name]
+            if is_occupied:
+                color, status = (0, 0, 255), "Ocupado"
+            elif name in reserved:
+                color, status = (0, 215, 255), f"Reservado {reserved[name]}"
+            else:
+                color, status = (0, 255, 0), "Libre"
+            points = cell["points"]
+            cv2.polylines(frame, [points], True, color, 2)
+            cv2.putText(
+                frame,
+                f"{name}: {status}",
+                tuple(points[0] + np.array([0, -8])),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                color,
+                2,
+            )
+
+        occupied_count = sum(occupied.values())
+        state = {
+            "timestamp": time.time(),
+            "total_celdas": len(self.cells),
+            "ocupadas": occupied_count,
+            "libres": len(self.cells) - occupied_count,
+            "vehiculos_detectados": len(vehicles),
+            "congestion_porcentaje": round(occupied_count / len(self.cells) * 100, 2)
+            if self.cells
+            else 0.0,
+            "celdas": {
+                name: {
+                    "ocupado": is_occupied,
+                    "estado": "ocupado"
+                    if is_occupied
+                    else "reservado"
+                    if name in reserved
+                    else "libre",
+                }
+                for name, is_occupied in occupied.items()
+            },
+        }
+        return frame, state
 
     def first_free_space(self, state: dict[str, Any], reserved: set[str]) -> str | None:
         return next(
