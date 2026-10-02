@@ -10,6 +10,7 @@ lee las placas con Roboflow y asigna una celda libre a los vehículos registrado
 - `scripts/app/parking_detector.py`: usa YOLO para detectar vehículos y marcar las celdas ocupadas o libres, con suavizado entre cuadros.
 - `scripts/app/plate_reader.py`: envía capturas a Roboflow y confirma la placa con varias lecturas.
 - `scripts/app/video_service.py`: coordina el video, el detector, el lector de placas y las reservas de celdas.
+- `scripts/app/backend_client.py`: cuando una placa registrada se confirma, le pide a `educore-backend` que asigne y guarde el puesto (ver "Sincronización con el backend").
 - `scripts/app/main.py`: expone la API con FastAPI.
 - `scripts/api_video.py`: punto de entrada compatible con el comando anterior.
 
@@ -115,6 +116,40 @@ Las pruebas simulan YOLO, así que no necesitan GPU ni video.
 4. Si la placa está en `vehiculos_registrados.json`, se le reserva la primera celda libre.
    La reserva se libera cuando el vehículo se estaciona y luego sale, o después de
    `RESERVATION_TIMEOUT_SECONDS` si nunca llegó a ocuparla.
+5. Si `BACKEND_SYNC_ENABLED=true`, la misma placa confirmada se envía además a
+   `educore-backend` para que quede guardada de verdad (no solo en memoria local).
+
+## Sincronización con el backend
+
+Además de la reserva local (en memoria, para la vista en vivo), el servicio puede
+pedirle a `educore-backend` que haga y guarde la asignación real:
+
+1. Se autentica como una cuenta de servicio (un usuario con rol **Operador**, que
+   ya tiene los permisos `ASSIGNMENTS_MANAGE` y `PLATES_VIEW`).
+2. Con la placa confirmada, busca el vehículo (`GET /api/vehicles/plate/{placa}`).
+3. Si el vehículo está activo, busca el id del estudiante dueño por su código
+   (`GET /api/assignments/students`).
+4. Le pide al backend el espacio y lo guarda (`POST /api/assignments/auto`).
+
+Esto corre en un hilo aparte (`backend-sync`): si el backend no responde o la
+placa no está registrada allá, el video y la lectura de placas siguen igual —
+nunca se bloquean por esto. El resultado (sincronizado, error, o la placa no
+existe en el backend) queda en `GET /placas/estado` → `backend_estado`.
+
+Para activarlo, en `.env`:
+
+```
+BACKEND_SYNC_ENABLED=true
+BACKEND_BASE_URL=http://localhost:8080
+BACKEND_SERVICE_USER_CODE=OP001
+BACKEND_SERVICE_IDENTITY_DOCUMENT=<documento del operador>
+BACKEND_SERVICE_PASSWORD=<contraseña del operador>
+BACKEND_PARKING_ID=   # vacío = cualquier parqueadero con espacio libre
+```
+
+> Nota: el backend invalida la cookie CSRF en cuanto se hace cualquier petición
+> GET, así que `backend_client.py` vuelve a pedirla justo antes de cada POST
+> (el mismo motivo por el que el frontend también la reintenta).
 
 ### Formato de `vehiculos_registrados.json`
 

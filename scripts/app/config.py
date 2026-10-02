@@ -61,5 +61,22 @@ class Settings:
     roboflow_workspace: str = os.getenv("ROBOFLOW_WORKSPACE", "")
     roboflow_workflow: str = os.getenv("ROBOFLOW_WORKFLOW", "")
 
+    # --- Sincronización con el backend (educore-backend) ---
+    # Cuando una placa se confirma y está registrada, además de reservar la
+    # celda localmente se le pide al backend que asigne y guarde el espacio.
+    backend_sync_enabled: bool = os.getenv("BACKEND_SYNC_ENABLED", "false").lower() == "true"
+    backend_base_url: str = os.getenv("BACKEND_BASE_URL", "http://localhost:8080")
+    # Cuenta de servicio: un usuario con rol que tenga ASSIGNMENTS_MANAGE y
+    # PLATES_VIEW (el rol Operador ya los tiene).
+    backend_service_user_code: str = os.getenv("BACKEND_SERVICE_USER_CODE", "")
+    backend_service_identity_document: str = os.getenv("BACKEND_SERVICE_IDENTITY_DOCUMENT", "")
+    backend_service_password: str = os.getenv("BACKEND_SERVICE_PASSWORD", "")
+    # Id del parqueadero de esta cámara en el backend (opcional; vacío = cualquiera).
+    backend_parking_id: int | None = (
+        int(os.getenv("BACKEND_PARKING_ID")) if os.getenv("BACKEND_PARKING_ID") else None
+    )
+    backend_request_timeout_seconds: float = float(os.getenv("BACKEND_REQUEST_TIMEOUT_SECONDS", "5"))
+    backend_students_cache_seconds: float = float(os.getenv("BACKEND_STUDENTS_CACHE_SECONDS", "300"))
+
 
 settings = Settings()

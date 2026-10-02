@@ -9,6 +9,7 @@ from typing import Any
 import cv2
 import numpy as np
 
+from .backend_client import BackendClient, BackendError
 from .config import Settings
 from .parking_detector import ParkingDetector
 from .plate_reader import PlateReader, vehicle_crops
@@ -18,6 +19,7 @@ from .state import RuntimeState
 class VideoService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self.backend = BackendClient(settings) if settings.backend_sync_enabled else None
         self.parking = ParkingDetector(
             cells_path=settings.cells_path,
             model_path=settings.model_path,
@@ -158,10 +160,42 @@ class VideoService:
                 "celda_asignada": assigned_space,
                 "ultimo_intento": time.time(),
                 "error": None,
+                "backend_estado": "pendiente" if self.backend else "deshabilitado",
             },
             replace=True,
         )
         self.plates.start_cooldown(plate)
+        if self.backend:
+            threading.Thread(
+                target=self._sync_with_backend, args=(plate,), name="backend-sync", daemon=True
+            ).start()
+
+    def _sync_with_backend(self, plate: str) -> None:
+        """Le pide al backend que asigne y guarde el puesto para esta placa.
+
+        Corre en su propio hilo: una falla de red o un rechazo del backend
+        nunca debe detener la detección de video ni el reconocimiento de placas.
+        """
+        try:
+            result = self.backend.sync_plate_detection(plate)
+        except BackendError as error:
+            self.state.update_plate({"backend_estado": "error", "backend_error": str(error)})
+            return
+
+        if result is None:
+            self.state.update_plate(
+                {"backend_estado": "sin_registro_backend", "backend_error": None}
+            )
+            return
+
+        self.state.update_plate(
+            {
+                "backend_estado": "sincronizado",
+                "backend_error": None,
+                "backend_asignacion_id": result.assignment_id,
+                "backend_puesto_id": result.parking_space_id,
+            }
+        )
 
     def _read_plate(self, images: list[np.ndarray]) -> None:
         try:

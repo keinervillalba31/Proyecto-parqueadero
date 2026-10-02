@@ -7,3 +7,4 @@ ultralytics
 inference-sdk
 python-multipart
 python-dotenv
+requests

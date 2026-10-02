@@ -26,6 +26,10 @@ class RuntimeState:
                 "estado": "esperando",
                 "ultimo_intento": None,
                 "error": None,
+                "backend_estado": "deshabilitado",
+                "backend_error": None,
+                "backend_asignacion_id": None,
+                "backend_puesto_id": None,
             },
         }
 
