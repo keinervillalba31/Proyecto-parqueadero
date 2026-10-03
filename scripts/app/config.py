@@ -21,13 +21,20 @@ def project_path(variable: str, default: Path) -> Path:
     return path if path.is_absolute() else PROJECT_DIR / path
 
 
-def video_source_from_env(default: str) -> str:
+def resolve_source(value: str) -> str:
     """Índice de cámara, URL o ruta de archivo (relativa a la raíz del proyecto)."""
-    value = os.getenv("VIDEO_SOURCE", default)
     if not value or value.isdigit() or "://" in value:
         return value
     path = Path(value)
     return str(path if path.is_absolute() else PROJECT_DIR / path)
+
+
+def video_source_from_env(default: str) -> str:
+    return resolve_source(os.getenv("VIDEO_SOURCE", default))
+
+
+def video_fallback_from_env() -> str:
+    return resolve_source(os.getenv("VIDEO_FALLBACK", ""))
 
 
 @dataclass(frozen=True)
@@ -58,6 +65,12 @@ class Settings:
     plate_min_crop_width: int = int(os.getenv("PLATE_MIN_CROP_WIDTH", "120"))
     plate_skip_parked: bool = os.getenv("PLATE_SKIP_PARKED", "true").lower() == "true"
     video_retry_seconds: float = float(os.getenv("VIDEO_RETRY_SECONDS", "2"))
+    # Video que se repite en bucle mientras la cámara principal no responde.
+    video_fallback: str = video_fallback_from_env()
+    # Cada cuántos segundos se reintenta la cámara principal mientras se usa el respaldo.
+    video_camera_retry_seconds: float = float(os.getenv("VIDEO_CAMERA_RETRY_SECONDS", "10"))
+    service_host: str = os.getenv("SERVICE_HOST", "0.0.0.0")
+    service_port: int = int(os.getenv("SERVICE_PORT", "8000"))
     roboflow_workspace: str = os.getenv("ROBOFLOW_WORKSPACE", "")
     roboflow_workflow: str = os.getenv("ROBOFLOW_WORKFLOW", "")
 

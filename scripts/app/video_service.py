@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from pathlib import Path
@@ -14,6 +15,8 @@ from .config import Settings
 from .parking_detector import ParkingDetector
 from .plate_reader import PlateReader, vehicle_crops
 from .state import RuntimeState
+
+log = logging.getLogger("parqueadero")
 
 
 class VideoService:
@@ -50,6 +53,13 @@ class VideoService:
         self.frame_number = 0
         self.thread: threading.Thread | None = None
         self.running = False
+        self.active_source = settings.video_source
+        self.loop_count = 0
+        self.using_fallback = False
+        self.last_primary_attempt = 0.0
+        self.probe_lock = threading.Lock()
+        self.probe_thread: threading.Thread | None = None
+        self.probed_capture: cv2.VideoCapture | None = None
 
     @staticmethod
     def _load_registered_vehicles(path: Path) -> dict[str, Any]:
@@ -69,20 +79,91 @@ class VideoService:
         self.running = False
         if self.thread and self.thread is not threading.current_thread():
             self.thread.join(timeout=2)
+        with self.probe_lock:
+            if self.probed_capture is not None:
+                self.probed_capture.release()
+                self.probed_capture = None
 
-    def _open_source(self) -> cv2.VideoCapture:
-        source: int | str = (
-            int(self.settings.video_source)
-            if self.settings.video_source.isdigit()
-            else self.settings.video_source
-        )
+    @staticmethod
+    def _open_capture(source_text: str) -> cv2.VideoCapture:
+        source: int | str = int(source_text) if source_text.isdigit() else source_text
         capture = cv2.VideoCapture(source)
         if not capture.isOpened():
+            capture.release()
             raise RuntimeError(f"No se pudo abrir la fuente de video: {source}")
         return capture
 
+    def _use_fallback(self) -> bool:
+        fallback = self.settings.video_fallback
+        return bool(fallback) and fallback != self.settings.video_source
+
+    def _open_source(self) -> cv2.VideoCapture:
+        """Abre la cámara principal; si no responde, el video de respaldo en bucle."""
+        try:
+            capture = self._open_capture(self.settings.video_source)
+        except RuntimeError:
+            if not self._use_fallback():
+                raise
+            capture = self._open_capture(self.settings.video_fallback)
+            self._set_source(self.settings.video_fallback, using_fallback=True)
+            return capture
+        self._set_source(self.settings.video_source, using_fallback=False)
+        return capture
+
+    def _set_source(self, origin: str, using_fallback: bool) -> None:
+        if using_fallback:
+            log.warning("Cámara principal no disponible; usando el video de respaldo en bucle: %s", origin)
+        else:
+            log.info("Usando la fuente principal: %s", origin)
+        self.active_source = origin
+        self.using_fallback = using_fallback
+        self.last_primary_attempt = time.monotonic()
+        self.state.update_source(
+            {
+                "modo": "respaldo" if using_fallback else "principal",
+                "origen": origin,
+                "respaldo": self.settings.video_fallback or None,
+            }
+        )
+
     def _source_is_file(self) -> bool:
-        return Path(self.settings.video_source).is_file()
+        return Path(self.active_source).is_file()
+
+    def _probe_primary(self) -> None:
+        """Intenta abrir la cámara principal en un hilo aparte.
+
+        Abrir una URL que no responde puede tardar decenas de segundos; hacerlo
+        en el hilo del video congelaría la reproducción del respaldo.
+        """
+        try:
+            capture = self._open_capture(self.settings.video_source)
+        except RuntimeError:
+            return
+        with self.probe_lock:
+            if self.probed_capture is not None:
+                self.probed_capture.release()
+            self.probed_capture = capture
+
+    def _maybe_switch_to_primary(self, capture: cv2.VideoCapture) -> cv2.VideoCapture:
+        """Si la cámara principal ya responde, deja el respaldo y pasa a ella."""
+        if not self.using_fallback:
+            return capture
+
+        with self.probe_lock:
+            ready, self.probed_capture = self.probed_capture, None
+        if ready is not None:
+            capture.release()
+            self._set_source(self.settings.video_source, using_fallback=False)
+            return ready
+
+        due = time.monotonic() - self.last_primary_attempt >= self.settings.video_camera_retry_seconds
+        if due and (self.probe_thread is None or not self.probe_thread.is_alive()):
+            self.last_primary_attempt = time.monotonic()
+            self.probe_thread = threading.Thread(
+                target=self._probe_primary, name="camera-probe", daemon=True
+            )
+            self.probe_thread.start()
+        return capture
 
     def _plate_attempt_allowed(self, vehicle_detected: bool) -> bool:
         if self.settings.plate_require_vehicle and not vehicle_detected:
@@ -235,9 +316,12 @@ class VideoService:
                     capture = self._open_source()
                     self.state.worker_error = None
 
+                capture = self._maybe_switch_to_primary(capture)
                 ok, frame = capture.read()
                 if not ok and self._source_is_file():
                     # Un video de prueba terminó: se repite desde el inicio.
+                    self.loop_count += 1
+                    log.info("El video terminó; se repite desde el inicio (vuelta %d)", self.loop_count)
                     capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     ok, frame = capture.read()
                 if not ok:
@@ -286,4 +370,8 @@ class VideoService:
             capture.release()
 
     def health(self) -> dict[str, str | bool]:
-        return {"ok": self.state.worker_error is None, "error": self.state.worker_error or ""}
+        return {
+            "ok": self.state.worker_error is None,
+            "error": self.state.worker_error or "",
+            "fuente": "respaldo" if self.using_fallback else "principal",
+        }

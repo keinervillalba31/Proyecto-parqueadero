@@ -54,9 +54,32 @@ video, y si la proporción no coincide se muestra una advertencia.
 
 ### 2. Ejecutar el servicio
 
+Un solo comando; al encender ya queda leyendo video, detectando y sincronizando:
+
 ```powershell
-python -m uvicorn api_video:app --app-dir scripts --host 0.0.0.0 --port 8000
+python run_service.py
 ```
+
+(El comando anterior, `python -m uvicorn api_video:app --app-dir scripts ...`, sigue funcionando.)
+
+**Cámara con video de respaldo.** Pon la cámara en `VIDEO_SOURCE` (por ejemplo
+`rtsp://usuario:clave@192.168.1.20/stream`) y un video corto en `VIDEO_FALLBACK`.
+Si la cámara no responde, el servicio reproduce ese video en bucle sin parar y
+reintenta la cámara cada `VIDEO_CAMERA_RETRY_SECONDS`; cuando responde, cambia a
+ella solo. Si la cámara se cae después, vuelve al respaldo. La fuente en uso
+aparece en `GET /estado` → `fuente.modo` (`principal` o `respaldo`) y en `GET /health`.
+
+**Arranque automático en Windows** (sin abrir consola ni ejecutar nada), con el
+Programador de tareas; se reinicia solo si falla:
+
+```powershell
+.\scripts\windows\servicio.ps1 instalar        # arranca al iniciar sesión
+.\scripts\windows\servicio.ps1 instalar -AlEncender   # como administrador: arranca al encender el equipo
+.\scripts\windows\servicio.ps1 iniciar | detener | estado | desinstalar
+```
+
+> Sin GPU, YOLO con `YOLO_TILE_GRID=2` procesa unos 2 cuadros por segundo. Para ir
+> más rápido pon `YOLO_TILE_GRID=1`.
 
 Luego abre http://localhost:8000/video para ver el video anotado o http://localhost:8000/docs para probar la API.
 Si `VIDEO_SOURCE` es un archivo, el video se repite en bucle.

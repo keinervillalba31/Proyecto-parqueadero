@@ -20,6 +20,7 @@ class RuntimeState:
             "congestion_porcentaje": 0.0,
             "celdas": {},
             "reservas": {},
+            "fuente": {"modo": "iniciando", "origen": None, "respaldo": None},
             "placa": {
                 "valor": None,
                 "lecturas": [],
@@ -41,7 +42,13 @@ class RuntimeState:
         """Actualiza la ocupación sin tocar la placa, que la escribe otro hilo."""
         with self.lock:
             placa = self.data["placa"]
-            self.data = {**data, "placa": placa}
+            fuente = self.data["fuente"]
+            self.data = {**data, "placa": placa, "fuente": fuente}
+
+    def update_source(self, changes: dict[str, Any]) -> None:
+        """Indica qué fuente de video se está usando (cámara o video de respaldo)."""
+        with self.lock:
+            self.data["fuente"] = {**self.data["fuente"], **changes}
 
     def update_plate(self, changes: dict[str, Any], replace: bool = False) -> None:
         """Mezcla los cambios con la placa actual de forma atómica."""
