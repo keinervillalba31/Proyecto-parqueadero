@@ -78,8 +78,20 @@ Programador de tareas; se reinicia solo si falla:
 .\scripts\windows\servicio.ps1 iniciar | detener | estado | desinstalar
 ```
 
-> Sin GPU, YOLO con `YOLO_TILE_GRID=2` procesa unos 2 cuadros por segundo. Para ir
-> más rápido pon `YOLO_TILE_GRID=1`.
+**Tiempo real.** El video y la detección corren en hilos separados: `/video` entrega
+el video a su velocidad real (~24 cuadros/s) y YOLO analiza siempre el cuadro más
+reciente, descartando los intermedios si no da abasto, y dibuja su último resultado
+sobre cada cuadro nuevo. Así el video nunca se atrasa, aunque el análisis sea más
+lento. `GET /estado` → `rendimiento` muestra `fps_video` y `fps_analisis`.
+
+Medido en un equipo sin GPU (video de 1280x720):
+
+| `YOLO_TILE_GRID` | Video | Análisis de YOLO |
+|---|---|---|
+| 2 (máxima precisión) | ~24 cuadros/s | ~1 por segundo |
+| 1 | ~24 cuadros/s | ~4-5 por segundo |
+
+Con una GPU el análisis sube a decenas por segundo y se puede usar `YOLO_TILE_GRID=2`.
 
 Luego abre http://localhost:8000/video para ver el video anotado o http://localhost:8000/docs para probar la API.
 Si `VIDEO_SOURCE` es un archivo, el video se repite en bucle.

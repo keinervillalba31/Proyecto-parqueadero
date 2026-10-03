@@ -173,10 +173,25 @@ class ParkingDetector:
     def detect(
         self, frame: np.ndarray, reserved: dict[str, str] | None = None
     ) -> tuple[np.ndarray, dict[str, Any]]:
+        """Analiza el cuadro y dibuja el resultado sobre él."""
         reserved = reserved or {}
-        occupied = {name: False for name in self.cells}
-        vehicles = self.vehicles.detect(frame)
+        state, vehicles = self.analyze(frame, reserved)
+        self.draw(frame, vehicles, state, reserved)
+        return frame, state
 
+    def draw(
+        self,
+        frame: np.ndarray,
+        vehicles: list[Vehicle],
+        state: dict[str, Any],
+        reserved: dict[str, str] | None = None,
+    ) -> None:
+        """Dibuja vehículos y celdas sobre un cuadro.
+
+        Está separado del análisis para poder pintar el último resultado sobre
+        cada cuadro nuevo del video sin tener que volver a correr YOLO.
+        """
+        reserved = reserved or {}
         for vehicle in vehicles:
             x1, y1, x2, y2 = vehicle.box
             cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 0), 2)
@@ -190,17 +205,9 @@ class ParkingDetector:
                 2,
             )
 
-            for name, cell in self.cells.items():
-                if cell["polygon"].covers(vehicle.footpoint):
-                    occupied[name] = True
-                    vehicle.in_cell = True
-
-        self.last_vehicles = vehicles
-        occupied = self._smooth(occupied)
-
+        cells_state = state.get("celdas", {})
         for name, cell in self.cells.items():
-            is_occupied = occupied[name]
-            if is_occupied:
+            if cells_state.get(name, {}).get("ocupado"):
                 color, status = (0, 0, 255), "Ocupado"
             elif name in reserved:
                 color, status = (0, 215, 255), f"Reservado {reserved[name]}"
@@ -217,6 +224,23 @@ class ParkingDetector:
                 color,
                 2,
             )
+
+    def analyze(
+        self, frame: np.ndarray, reserved: dict[str, str] | None = None
+    ) -> tuple[dict[str, Any], list[Vehicle]]:
+        """Corre YOLO y decide qué celdas están ocupadas, sin modificar el cuadro."""
+        reserved = reserved or {}
+        occupied = {name: False for name in self.cells}
+        vehicles = self.vehicles.detect(frame)
+
+        for vehicle in vehicles:
+            for name, cell in self.cells.items():
+                if cell["polygon"].covers(vehicle.footpoint):
+                    occupied[name] = True
+                    vehicle.in_cell = True
+
+        self.last_vehicles = vehicles
+        occupied = self._smooth(occupied)
 
         occupied_count = sum(occupied.values())
         state = {
@@ -240,7 +264,7 @@ class ParkingDetector:
                 for name, is_occupied in occupied.items()
             },
         }
-        return frame, state
+        return state, vehicles
 
     def first_free_space(self, state: dict[str, Any], reserved: set[str]) -> str | None:
         return next(

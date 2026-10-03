@@ -97,7 +97,7 @@ def video_stream() -> StreamingResponse:
             if frame is not None and frame_id != last_id:
                 last_id = frame_id
                 yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
-            time.sleep(0.04)
+            time.sleep(0.01)
 
     return StreamingResponse(
         frames(), media_type="multipart/x-mixed-replace; boundary=frame"

@@ -53,6 +53,18 @@ class VideoService:
         self.frame_number = 0
         self.thread: threading.Thread | None = None
         self.running = False
+        # Cuadro más reciente del video y último resultado de YOLO; los
+        # comparten el hilo de video y el de detección.
+        self.frame_lock = threading.Lock()
+        self.latest_frame: np.ndarray | None = None
+        self.latest_frame_id = 0
+        self.overlay: tuple[Any, ...] | None = None
+        self.detect_thread: threading.Thread | None = None
+        self.detector_failed = False
+        self.analysis_seconds = 0.0
+        self.next_frame_at = 0.0
+        self.video_frames = 0
+        self.fps_window_start = time.monotonic()
         self.active_source = settings.video_source
         self.loop_count = 0
         self.using_fallback = False
@@ -73,12 +85,17 @@ class VideoService:
             return
         self.running = True
         self.thread = threading.Thread(target=self._run, name="video-worker", daemon=True)
+        self.detect_thread = threading.Thread(
+            target=self._detect_loop, name="detector-worker", daemon=True
+        )
         self.thread.start()
+        self.detect_thread.start()
 
     def stop(self) -> None:
         self.running = False
-        if self.thread and self.thread is not threading.current_thread():
-            self.thread.join(timeout=2)
+        for worker in (self.thread, self.detect_thread):
+            if worker and worker is not threading.current_thread():
+                worker.join(timeout=2)
         with self.probe_lock:
             if self.probed_capture is not None:
                 self.probed_capture.release()
@@ -306,17 +323,76 @@ class VideoService:
         except Exception as error:
             self.state.update_plate({"estado": "error_lectura", "error": str(error)})
 
+    def _frame_interval(self, capture: cv2.VideoCapture) -> float:
+        """Segundos entre cuadros para reproducir un archivo a su velocidad real.
+
+        Una cámara entrega los cuadros a su propio ritmo; un archivo no, así que
+        hay que frenarlo o se reproduciría tan rápido como lo lea el disco.
+        """
+        if not self._source_is_file():
+            return 0.0
+        fps = capture.get(cv2.CAP_PROP_FPS)
+        return 1.0 / fps if fps and 1 <= fps <= 120 else 1.0 / 25
+
+    def _pace(self, interval: float) -> None:
+        if interval <= 0:
+            self.next_frame_at = 0.0
+            return
+        now = time.monotonic()
+        if self.next_frame_at == 0.0 or now - self.next_frame_at > 1.0:
+            self.next_frame_at = now
+        wait = self.next_frame_at - now
+        if wait > 0:
+            time.sleep(wait)
+        self.next_frame_at += interval
+
+    def _publish_frame(self, frame: np.ndarray) -> None:
+        """Entrega el cuadro al detector y publica la vista en vivo.
+
+        La vista usa el último resultado de YOLO dibujado sobre el cuadro nuevo:
+        el video siempre va en tiempo real y las cajas se actualizan en cuanto
+        el detector termina un análisis.
+        """
+        with self.frame_lock:
+            self.latest_frame = frame
+            self.latest_frame_id += 1
+            overlay = self.overlay
+        display = frame.copy()
+        if overlay:
+            self.parking.draw(display, *overlay)
+        encoded_ok, encoded = cv2.imencode(".jpg", display, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        if encoded_ok:
+            self.state.set_frame(encoded.tobytes())
+        self._count_video_frame()
+
+    def _count_video_frame(self) -> None:
+        self.video_frames += 1
+        now = time.monotonic()
+        elapsed = now - self.fps_window_start
+        if elapsed >= 2.0:
+            self.state.update_performance({"fps_video": round(self.video_frames / elapsed, 1)})
+            self.video_frames = 0
+            self.fps_window_start = now
+
     def _run(self) -> None:
+        """Hilo de video: lee cuadros y los publica sin esperar a YOLO."""
         capture: cv2.VideoCapture | None = None
+        interval = 0.0
         while self.running:
             try:
                 if capture is None or not capture.isOpened():
                     if capture is not None:
                         capture.release()
                     capture = self._open_source()
+                    interval = self._frame_interval(capture)
                     self.state.worker_error = None
 
-                capture = self._maybe_switch_to_primary(capture)
+                switched = self._maybe_switch_to_primary(capture)
+                if switched is not capture:
+                    capture = switched
+                    interval = self._frame_interval(capture)
+
+                self._pace(interval)
                 ok, frame = capture.read()
                 if not ok and self._source_is_file():
                     # Un video de prueba terminó: se repite desde el inicio.
@@ -331,34 +407,7 @@ class VideoService:
                     time.sleep(self.settings.video_retry_seconds)
                     continue
 
-                self.frame_number += 1
-                # Se copia antes de detectar porque `detect` dibuja sobre el cuadro.
-                clean_frame = frame.copy()
-                annotated, parking_state = self.parking.detect(
-                    frame, self.reserved_cells()
-                )
-                self._update_reservations(parking_state)
-                vehicle_detected = parking_state["vehiculos_detectados"] > 0
-                if self._plate_attempt_allowed(vehicle_detected) and (
-                    self.plate_thread is None or not self.plate_thread.is_alive()
-                ):
-                    images = self._plate_images(clean_frame)
-                    if images:
-                        self.plate_thread = threading.Thread(
-                            target=self._read_plate,
-                            args=(images,),
-                            name="plate-reader",
-                            daemon=True,
-                        )
-                        self.plate_thread.start()
-                self.vehicle_was_detected = vehicle_detected
-
-                encoded_ok, encoded = cv2.imencode(
-                    ".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 80]
-                )
-                if encoded_ok:
-                    self.state.set_frame(encoded.tobytes())
-                self.state.update(parking_state)
+                self._publish_frame(frame)
             except Exception as error:
                 self.state.worker_error = str(error)
                 if capture is not None:
@@ -368,6 +417,56 @@ class VideoService:
 
         if capture is not None:
             capture.release()
+
+    def _detect_loop(self) -> None:
+        """Hilo de detección: analiza siempre el cuadro más reciente.
+
+        Si YOLO es más lento que el video, los cuadros intermedios se descartan
+        en vez de acumularse; así el análisis nunca se atrasa respecto a la realidad.
+        """
+        last_id = 0
+        while self.running:
+            with self.frame_lock:
+                frame, frame_id = self.latest_frame, self.latest_frame_id
+            if frame is None or frame_id == last_id:
+                time.sleep(0.005)
+                continue
+            last_id = frame_id
+            try:
+                self._process_detection(frame)
+            except Exception as error:
+                self.state.worker_error = str(error)
+                self.detector_failed = True
+                time.sleep(self.settings.video_retry_seconds)
+
+    def _process_detection(self, frame: np.ndarray) -> None:
+        started = time.perf_counter()
+        self.frame_number += 1
+        reserved = self.reserved_cells()
+        parking_state, vehicles = self.parking.analyze(frame, reserved)
+        self._update_reservations(parking_state)
+        with self.frame_lock:
+            self.overlay = (vehicles, parking_state, reserved)
+
+        vehicle_detected = parking_state["vehiculos_detectados"] > 0
+        if self._plate_attempt_allowed(vehicle_detected) and (
+            self.plate_thread is None or not self.plate_thread.is_alive()
+        ):
+            images = self._plate_images(frame)
+            if images:
+                self.plate_thread = threading.Thread(
+                    target=self._read_plate, args=(images,), name="plate-reader", daemon=True
+                )
+                self.plate_thread.start()
+        self.vehicle_was_detected = vehicle_detected
+
+        self.state.update(parking_state)
+        if self.detector_failed:
+            self.detector_failed = False
+            self.state.worker_error = None
+        seconds = time.perf_counter() - started
+        self.analysis_seconds = seconds if not self.analysis_seconds else 0.8 * self.analysis_seconds + 0.2 * seconds
+        self.state.update_performance({"fps_analisis": round(1 / self.analysis_seconds, 1)})
 
     def health(self) -> dict[str, str | bool]:
         return {

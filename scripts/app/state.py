@@ -21,6 +21,8 @@ class RuntimeState:
             "celdas": {},
             "reservas": {},
             "fuente": {"modo": "iniciando", "origen": None, "respaldo": None},
+            # Cuadros por segundo del video en vivo y de los análisis de YOLO.
+            "rendimiento": {"fps_video": 0.0, "fps_analisis": 0.0},
             "placa": {
                 "valor": None,
                 "lecturas": [],
@@ -43,7 +45,12 @@ class RuntimeState:
         with self.lock:
             placa = self.data["placa"]
             fuente = self.data["fuente"]
-            self.data = {**data, "placa": placa, "fuente": fuente}
+            rendimiento = self.data["rendimiento"]
+            self.data = {**data, "placa": placa, "fuente": fuente, "rendimiento": rendimiento}
+
+    def update_performance(self, changes: dict[str, Any]) -> None:
+        with self.lock:
+            self.data["rendimiento"] = {**self.data["rendimiento"], **changes}
 
     def update_source(self, changes: dict[str, Any]) -> None:
         """Indica qué fuente de video se está usando (cámara o video de respaldo)."""
