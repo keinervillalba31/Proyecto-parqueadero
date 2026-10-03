@@ -23,7 +23,9 @@ def main() -> None:
     if settings.video_fallback:
         print(f"Respaldo en bucle: {settings.video_fallback}")
     print(f"Servicio en http://{settings.service_host}:{settings.service_port}")
-    uvicorn.run(app, host=settings.service_host, port=settings.service_port)
+    # /video y /ws/estado nunca terminan solos: sin este límite, Ctrl+C se queda esperando
+    # mientras haya una pestaña con el video abierta.
+    uvicorn.run(app, host=settings.service_host, port=settings.service_port, timeout_graceful_shutdown=3)
 
 
 if __name__ == "__main__":
