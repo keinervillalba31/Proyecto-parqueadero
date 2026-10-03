@@ -31,6 +31,23 @@ Todas las rutas relativas del `.env` se toman desde la raíz del proyecto.
 
 Todos los comandos se ejecutan desde `Proyecto-parqueadero`.
 
+### 0. Celdas trazadas desde la plataforma (recomendado)
+
+El administrador traza las celdas **desde la plataforma web**, sin tocar este servicio:
+
+1. En **Monitoreo**, registra la cámara con la URL de transmisión `http://<este-servidor>:8000/video`.
+2. En su tarjeta pulsa **Trazar celdas**: se abre una imagen limpia de la cámara (`GET /snapshot`).
+   Con **+ Trazar celdas** marca las 4 esquinas de cada puesto, y a cada celda le asigna el puesto real
+   del parqueadero (A-01, N-03...). Las esquinas se pueden arrastrar para ajustarlas. **Guardar celdas**.
+3. En el `.env` de este servicio pon `BACKEND_SYNC_ENABLED=true` y `BACKEND_CAMERA_ID=<id de la cámara>`.
+
+El servicio trae esas celdas del backend al arrancar y **revisa cada `BACKEND_CELLS_POLL_SECONDS` si
+cambiaron**, así que ajustar o agregar celdas no requiere reiniciar nada. Las coordenadas se guardan
+relativas al tamaño de la imagen, por eso siguen valiendo si cambia la resolución. `GET /estado` indica en
+`fuente.celdas_origen` si se usan celdas de la `plataforma` o las `local`, y cada celda trae el
+`puesto` al que está vinculada. Si la plataforma aún no tiene celdas para la cámara, se usa el archivo
+local del paso siguiente.
+
 ### 1. Configurar las celdas
 
 ```powershell
@@ -126,6 +143,7 @@ Las pruebas simulan YOLO, así que no necesitan GPU ni video.
 
 ## Endpoints
 
+- `GET /snapshot`: cuadro actual sin dibujos (la plataforma lo usa para trazar celdas).
 - `GET /video`: video anotado en vivo (verde = libre, rojo = ocupado, amarillo = reservado).
 - `GET /espacios/estado`: ocupación de las celdas y reservas.
 - `GET /placas/estado`: última lectura y estado de la placa.

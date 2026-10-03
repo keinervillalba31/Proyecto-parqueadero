@@ -60,6 +60,8 @@ class VideoService:
         self.latest_frame_id = 0
         self.overlay: tuple[Any, ...] | None = None
         self.detect_thread: threading.Thread | None = None
+        self.cells_thread: threading.Thread | None = None
+        self.cells_version: str | None = None
         self.detector_failed = False
         self.analysis_seconds = 0.0
         self.next_frame_at = 0.0
@@ -84,6 +86,9 @@ class VideoService:
         if self.running:
             return
         self.running = True
+        if self.backend and self.settings.backend_camera_id is not None:
+            self.cells_thread = threading.Thread(target=self._cells_loop, name="cells-sync", daemon=True)
+            self.cells_thread.start()
         self.thread = threading.Thread(target=self._run, name="video-worker", daemon=True)
         self.detect_thread = threading.Thread(
             target=self._detect_loop, name="detector-worker", daemon=True
@@ -93,7 +98,7 @@ class VideoService:
 
     def stop(self) -> None:
         self.running = False
-        for worker in (self.thread, self.detect_thread):
+        for worker in (self.thread, self.detect_thread, self.cells_thread):
             if worker and worker is not threading.current_thread():
                 worker.join(timeout=2)
         with self.probe_lock:
@@ -323,6 +328,46 @@ class VideoService:
         except Exception as error:
             self.state.update_plate({"estado": "error_lectura", "error": str(error)})
 
+    def _refresh_cells(self) -> bool:
+        """Trae las celdas de la plataforma y las aplica si cambiaron. True si hubo cambio."""
+        try:
+            data = self.backend.get_camera_cells(self.settings.backend_camera_id)
+        except BackendError as error:
+            log.warning("No se pudieron traer las celdas de la plataforma: %s", error)
+            return False
+
+        version = str(data.get("version", ""))
+        if version == self.cells_version:
+            return False
+        self.cells_version = version
+
+        cells = {
+            cell["label"]: {
+                "points": cell["points"],
+                "puesto_id": cell.get("parkingSpaceId"),
+                "puesto": cell.get("parkingSpaceNumber"),
+            }
+            for cell in data.get("cells", [])
+        }
+        if not cells:
+            log.info("La plataforma no tiene celdas para esta cámara; se siguen usando las locales.")
+            self.state.update_source({"celdas_origen": "local", "celdas_version": version})
+            return False
+
+        self.parking.set_relative_cells(cells)
+        self.state.update_source({"celdas_origen": "plataforma", "celdas_version": version})
+        log.info("Celdas actualizadas desde la plataforma: %d (versión %s)", len(cells), version)
+        return True
+
+    def _cells_loop(self) -> None:
+        """Revisa cada cierto tiempo si el administrador cambió las celdas."""
+        while self.running:
+            self._refresh_cells()
+            waited = 0.0
+            while self.running and waited < self.settings.backend_cells_poll_seconds:
+                time.sleep(0.5)
+                waited += 0.5
+
     def _frame_interval(self, capture: cv2.VideoCapture) -> float:
         """Segundos entre cuadros para reproducir un archivo a su velocidad real.
 
@@ -467,6 +512,15 @@ class VideoService:
         seconds = time.perf_counter() - started
         self.analysis_seconds = seconds if not self.analysis_seconds else 0.8 * self.analysis_seconds + 0.2 * seconds
         self.state.update_performance({"fps_analisis": round(1 / self.analysis_seconds, 1)})
+
+    def snapshot_jpeg(self) -> bytes | None:
+        """El cuadro más reciente tal como lo entrega la fuente, sin cajas ni celdas dibujadas."""
+        with self.frame_lock:
+            frame = self.latest_frame
+        if frame is None:
+            return None
+        ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        return encoded.tobytes() if ok else None
 
     def health(self) -> dict[str, str | bool]:
         return {

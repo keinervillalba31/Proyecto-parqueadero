@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -158,6 +159,46 @@ class ParkingDetector:
         self.occupancy_frames = max(occupancy_frames, 1)
         self.stable_occupied = {name: False for name in self.cells}
         self.pending_frames = {name: 0 for name in self.cells}
+        # Celdas traídas de la plataforma, en coordenadas relativas (0 a 1); se
+        # convierten a píxeles según el tamaño real del video. nombre -> datos.
+        self.cell_meta: dict[str, dict[str, Any]] = {}
+        self._relative_cells: dict[str, dict[str, Any]] | None = None
+        self._scaled_size: tuple[int, int] | None = None
+        self._incoming_cells: dict[str, dict[str, Any]] | None = None
+        self._incoming_lock = threading.Lock()
+
+    def set_relative_cells(self, cells: dict[str, dict[str, Any]]) -> None:
+        """Reemplaza las celdas por las de la plataforma.
+
+        Se puede llamar desde otro hilo: el cambio se aplica al inicio del
+        siguiente análisis, para no tocar las celdas mientras se usan.
+        cells: nombre -> {"points": [[x, y] x4, valores 0..1], "puesto_id": int|None, "puesto": str|None}
+        """
+        with self._incoming_lock:
+            self._incoming_cells = cells
+
+    def _apply_cell_changes(self, width: int, height: int) -> None:
+        with self._incoming_lock:
+            incoming, self._incoming_cells = self._incoming_cells, None
+        if incoming is not None:
+            self._relative_cells = incoming
+            self._scaled_size = None
+        if self._relative_cells is None or self._scaled_size == (width, height):
+            return
+
+        cells = {}
+        for name, data in self._relative_cells.items():
+            points = [[round(x * width), round(y * height)] for x, y in data["points"]]
+            cells[name] = {"points": np.array(points, dtype=np.int32), "polygon": Polygon(points)}
+        # Las celdas que siguen existiendo conservan su estado ya suavizado.
+        self.stable_occupied = {name: self.stable_occupied.get(name, False) for name in cells}
+        self.pending_frames = {name: self.pending_frames.get(name, 0) for name in cells}
+        self.cell_meta = {
+            name: {"puesto_id": data.get("puesto_id"), "puesto": data.get("puesto")}
+            for name, data in self._relative_cells.items()
+        }
+        self.cells = cells
+        self._scaled_size = (width, height)
 
     def _smooth(self, raw_occupied: dict[str, bool]) -> dict[str, bool]:
         for name, is_occupied in raw_occupied.items():
@@ -230,6 +271,8 @@ class ParkingDetector:
     ) -> tuple[dict[str, Any], list[Vehicle]]:
         """Corre YOLO y decide qué celdas están ocupadas, sin modificar el cuadro."""
         reserved = reserved or {}
+        height, width = frame.shape[:2]
+        self._apply_cell_changes(width, height)
         occupied = {name: False for name in self.cells}
         vehicles = self.vehicles.detect(frame)
 
@@ -260,6 +303,8 @@ class ParkingDetector:
                     else "reservado"
                     if name in reserved
                     else "libre",
+                    "puesto_id": self.cell_meta.get(name, {}).get("puesto_id"),
+                    "puesto": self.cell_meta.get(name, {}).get("puesto"),
                 }
                 for name, is_occupied in occupied.items()
             },

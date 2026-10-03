@@ -8,7 +8,7 @@ from typing import Any
 import cv2
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
 from .config import settings
 from .video_service import VideoService
@@ -85,6 +85,15 @@ def read_license_plates(image: UploadFile = File(...)) -> dict[str, Any]:
     except Exception as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
     return {"plate": plate, "registered": plate in service.registered_vehicles if plate else False}
+
+
+@app.get("/snapshot")
+def snapshot() -> Response:
+    """Cuadro actual sin dibujos (para trazar celdas desde la plataforma)."""
+    image = service.snapshot_jpeg()
+    if image is None:
+        raise HTTPException(status_code=503, detail="Aún no hay imagen de la cámara")
+    return Response(content=image, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/video")

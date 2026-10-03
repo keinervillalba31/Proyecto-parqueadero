@@ -88,6 +88,12 @@ class Settings:
     backend_parking_id: int | None = (
         int(os.getenv("BACKEND_PARKING_ID")) if os.getenv("BACKEND_PARKING_ID") else None
     )
+    # Id de esta cámara en la plataforma. Si se define, las celdas se toman de ahí
+    # (las traza el administrador desde Monitoreo) y se recargan solas al cambiar.
+    backend_camera_id: int | None = (
+        int(os.getenv("BACKEND_CAMERA_ID")) if os.getenv("BACKEND_CAMERA_ID") else None
+    )
+    backend_cells_poll_seconds: float = float(os.getenv("BACKEND_CELLS_POLL_SECONDS", "15"))
     backend_request_timeout_seconds: float = float(os.getenv("BACKEND_REQUEST_TIMEOUT_SECONDS", "5"))
     backend_students_cache_seconds: float = float(os.getenv("BACKEND_STUDENTS_CACHE_SECONDS", "300"))
 

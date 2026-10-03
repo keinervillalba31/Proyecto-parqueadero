@@ -128,6 +128,16 @@ class BackendClient:
             )
         return response.json().get("data")
 
+    def get_camera_cells(self, camera_id: int) -> dict[str, Any]:
+        """Celdas que el administrador trazó para esta cámara (coordenadas relativas 0 a 1)."""
+        response = self._request("GET", f"/api/monitoring/cameras/{camera_id}/cells")
+        if response.status_code != 200:
+            raise BackendError(
+                f"No se pudieron consultar las celdas de la cámara {camera_id} "
+                f"({response.status_code}): {response.text[:200]}"
+            )
+        return response.json().get("data", {"version": "", "cells": []})
+
     def list_students(self, force_refresh: bool = False) -> list[dict[str, Any]]:
         age = time.monotonic() - self._students_cache_at
         if not force_refresh and self._students_cache and age < self.settings.backend_students_cache_seconds:
