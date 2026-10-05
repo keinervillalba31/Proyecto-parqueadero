@@ -2,6 +2,7 @@ import threading
 import time
 from types import SimpleNamespace
 
+import cv2
 import numpy as np
 
 from app.state import RuntimeState
@@ -78,6 +79,18 @@ def test_process_detection_publishes_state_and_overlay(make_detector):
     assert snapshot["celdas"]["Celda_1"]["ocupado"] is True
     assert service.overlay is not None
     assert snapshot["rendimiento"]["fps_analisis"] > 0
+
+
+def test_publish_frame_streams_original_without_cell_overlay(make_detector):
+    service = make_service(make_detector(), detections=[CAR_IN_CELL_1])
+    service.overlay = ([CAR_IN_CELL_1], {"celdas": {}}, {})
+    frame = blank_frame()
+
+    service._publish_frame(frame)
+
+    _, encoded = service.state.get_frame()
+    published = cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_COLOR)
+    assert np.array_equal(published, frame)
 
 
 def test_process_detection_clears_a_previous_detector_error(make_detector):

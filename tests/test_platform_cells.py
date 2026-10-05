@@ -144,3 +144,94 @@ def test_get_camera_cells_raises_when_the_camera_does_not_exist(client):
 
     with pytest.raises(BackendError):
         backend.get_camera_cells(9)
+
+
+class OccupancyBackend:
+    def __init__(self, error=None):
+        self.error = error
+        self.reports: list[tuple[int, dict[int, bool]]] = []
+
+    def report_occupancy(self, camera_id, occupancy):
+        if self.error:
+            raise self.error
+        self.reports.append((camera_id, dict(occupancy)))
+        return {}
+
+
+def make_reporting_service(make_detector, backend, cells) -> VideoService:
+    service = make_service(make_detector, backend)
+    service.settings = SimpleNamespace(backend_camera_id=1, backend_occupancy_resend_seconds=60)
+    service.reported_occupancy = None
+    service.reported_at = 0.0
+    service.state.update({"celdas": cells})
+    return service
+
+
+def test_occupancy_is_reported_only_for_cells_linked_to_a_space(make_detector):
+    backend = OccupancyBackend()
+    service = make_reporting_service(
+        make_detector,
+        backend,
+        {
+            "A-01": {"ocupado": True, "puesto_id": 7},
+            "A-02": {"ocupado": False, "puesto_id": 8},
+            "Sin puesto": {"ocupado": True, "puesto_id": None},
+        },
+    )
+
+    assert service._report_occupancy() is True
+    assert backend.reports == [(1, {7: True, 8: False})]
+
+
+def test_unchanged_occupancy_is_not_resent_until_due(make_detector):
+    backend = OccupancyBackend()
+    service = make_reporting_service(make_detector, backend, {"A-01": {"ocupado": True, "puesto_id": 7}})
+
+    assert service._report_occupancy() is True
+    assert service._report_occupancy() is False
+
+    service.state.update({"celdas": {"A-01": {"ocupado": False, "puesto_id": 7}}})
+    assert service._report_occupancy() is True
+
+    service.reported_at -= 61
+    assert service._report_occupancy() is True
+    assert [report for _, report in backend.reports] == [{7: True}, {7: False}, {7: False}]
+
+
+def test_failed_report_is_retried_on_the_next_cycle(make_detector):
+    backend = OccupancyBackend(error=BackendError("caído"))
+    service = make_reporting_service(make_detector, backend, {"A-01": {"ocupado": True, "puesto_id": 7}})
+
+    assert service._report_occupancy() is False
+    backend.error = None
+    assert service._report_occupancy() is True
+
+
+def test_nothing_is_reported_without_platform_cells(make_detector):
+    backend = OccupancyBackend()
+    service = make_reporting_service(make_detector, backend, {"Celda_1": {"ocupado": True, "puesto_id": None}})
+
+    assert service._report_occupancy() is False
+    assert backend.reports == []
+
+
+def test_report_occupancy_posts_with_csrf(client):
+    backend, session = client
+    session.script["/api/monitoring/cameras/3/occupancy"] = FakeResponse(200, {"success": True, "data": {}})
+
+    backend.report_occupancy(3, {7: True, 8: False})
+
+    method, url, kwargs = session.calls[-1]
+    assert (method, url) == ("POST", "http://backend.test/api/monitoring/cameras/3/occupancy")
+    assert kwargs["json"] == {
+        "cells": [{"parkingSpaceId": 7, "occupied": True}, {"parkingSpaceId": 8, "occupied": False}]
+    }
+    assert kwargs["headers"]["X-XSRF-TOKEN"] == "csrf-token-1"
+
+
+def test_report_occupancy_raises_when_rejected(client):
+    backend, session = client
+    session.script["/api/monitoring/cameras/3/occupancy"] = FakeResponse(400, {}, text="puesto no vinculado")
+
+    with pytest.raises(BackendError):
+        backend.report_occupancy(3, {99: True})

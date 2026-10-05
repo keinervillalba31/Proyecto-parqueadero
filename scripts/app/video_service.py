@@ -62,6 +62,10 @@ class VideoService:
         self.detect_thread: threading.Thread | None = None
         self.cells_thread: threading.Thread | None = None
         self.cells_version: str | None = None
+        self.occupancy_thread: threading.Thread | None = None
+        # Última ocupación que aceptó el backend (puesto_id -> ocupado) y cuándo.
+        self.reported_occupancy: dict[int, bool] | None = None
+        self.reported_at = 0.0
         self.detector_failed = False
         self.analysis_seconds = 0.0
         self.next_frame_at = 0.0
@@ -89,6 +93,10 @@ class VideoService:
         if self.backend and self.settings.backend_camera_id is not None:
             self.cells_thread = threading.Thread(target=self._cells_loop, name="cells-sync", daemon=True)
             self.cells_thread.start()
+            self.occupancy_thread = threading.Thread(
+                target=self._occupancy_loop, name="occupancy-sync", daemon=True
+            )
+            self.occupancy_thread.start()
         self.thread = threading.Thread(target=self._run, name="video-worker", daemon=True)
         self.detect_thread = threading.Thread(
             target=self._detect_loop, name="detector-worker", daemon=True
@@ -98,7 +106,7 @@ class VideoService:
 
     def stop(self) -> None:
         self.running = False
-        for worker in (self.thread, self.detect_thread, self.cells_thread):
+        for worker in (self.thread, self.detect_thread, self.cells_thread, self.occupancy_thread):
             if worker and worker is not threading.current_thread():
                 worker.join(timeout=2)
         with self.probe_lock:
@@ -368,6 +376,47 @@ class VideoService:
                 time.sleep(0.5)
                 waited += 0.5
 
+    def _report_occupancy(self) -> bool:
+        """Envía al backend la ocupación de las celdas vinculadas a un puesto. True si se envió.
+
+        Solo se envía cuando cambia algo, o cada BACKEND_OCCUPANCY_RESEND_SECONDS
+        para corregir el backend si se reinició o alguien cambió un puesto a mano.
+        """
+        cells = self.state.snapshot().get("celdas", {})
+        occupancy = {
+            cell["puesto_id"]: bool(cell.get("ocupado"))
+            for cell in cells.values()
+            if cell.get("puesto_id") is not None
+        }
+        if not occupancy:
+            return False
+        resend_due = time.monotonic() - self.reported_at >= self.settings.backend_occupancy_resend_seconds
+        if occupancy == self.reported_occupancy and not resend_due:
+            return False
+        try:
+            self.backend.report_occupancy(self.settings.backend_camera_id, occupancy)
+        except BackendError as error:
+            log.warning("No se pudo enviar la ocupación al backend: %s", error)
+            return False
+        if occupancy != self.reported_occupancy:
+            log.info(
+                "Ocupación enviada al backend: %d de %d puestos ocupados",
+                sum(occupancy.values()),
+                len(occupancy),
+            )
+        self.reported_occupancy = occupancy
+        self.reported_at = time.monotonic()
+        return True
+
+    def _occupancy_loop(self) -> None:
+        """Mantiene el estado de los puestos del backend al día con lo que ve la cámara."""
+        while self.running:
+            self._report_occupancy()
+            waited = 0.0
+            while self.running and waited < self.settings.backend_occupancy_report_seconds:
+                time.sleep(0.5)
+                waited += 0.5
+
     def _frame_interval(self, capture: cv2.VideoCapture) -> float:
         """Segundos entre cuadros para reproducir un archivo a su velocidad real.
 
@@ -392,20 +441,11 @@ class VideoService:
         self.next_frame_at += interval
 
     def _publish_frame(self, frame: np.ndarray) -> None:
-        """Entrega el cuadro al detector y publica la vista en vivo.
-
-        La vista usa el último resultado de YOLO dibujado sobre el cuadro nuevo:
-        el video siempre va en tiempo real y las cajas se actualizan en cuanto
-        el detector termina un análisis.
-        """
+        """Entrega el cuadro original al detector y al stream en vivo."""
         with self.frame_lock:
             self.latest_frame = frame
             self.latest_frame_id += 1
-            overlay = self.overlay
-        display = frame.copy()
-        if overlay:
-            self.parking.draw(display, *overlay)
-        encoded_ok, encoded = cv2.imencode(".jpg", display, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        encoded_ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
         if encoded_ok:
             self.state.set_frame(encoded.tobytes())
         self._count_video_frame()

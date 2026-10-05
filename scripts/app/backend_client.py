@@ -138,6 +138,29 @@ class BackendClient:
             )
         return response.json().get("data", {"version": "", "cells": []})
 
+    def report_occupancy(self, camera_id: int, occupancy: dict[int, bool]) -> dict[str, Any]:
+        """Le dice al backend qué puestos vinculados a esta cámara tienen un vehículo.
+
+        El backend decide cómo cambia cada puesto: no libera uno asignado a un
+        estudiante ni toca los reservados o en mantenimiento.
+        """
+        response = self._mutating_request(
+            "POST",
+            f"/api/monitoring/cameras/{camera_id}/occupancy",
+            json={
+                "cells": [
+                    {"parkingSpaceId": space_id, "occupied": occupied}
+                    for space_id, occupied in occupancy.items()
+                ]
+            },
+        )
+        if response.status_code != 200:
+            raise BackendError(
+                f"El backend rechazó la ocupación de la cámara {camera_id} "
+                f"({response.status_code}): {response.text[:200]}"
+            )
+        return response.json().get("data", {})
+
     def list_students(self, force_refresh: bool = False) -> list[dict[str, Any]]:
         age = time.monotonic() - self._students_cache_at
         if not force_refresh and self._students_cache and age < self.settings.backend_students_cache_seconds:

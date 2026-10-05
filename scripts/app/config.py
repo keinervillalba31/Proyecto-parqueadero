@@ -94,6 +94,11 @@ class Settings:
         int(os.getenv("BACKEND_CAMERA_ID")) if os.getenv("BACKEND_CAMERA_ID") else None
     )
     backend_cells_poll_seconds: float = float(os.getenv("BACKEND_CELLS_POLL_SECONDS", "15"))
+    # Cada cuánto se revisa si cambió la ocupación de las celdas para enviarla al backend.
+    # Aunque no cambie, se reenvía cada BACKEND_OCCUPANCY_RESEND_SECONDS por si el backend
+    # se reinició o alguien cambió un puesto a mano.
+    backend_occupancy_report_seconds: float = float(os.getenv("BACKEND_OCCUPANCY_REPORT_SECONDS", "2"))
+    backend_occupancy_resend_seconds: float = float(os.getenv("BACKEND_OCCUPANCY_RESEND_SECONDS", "60"))
     backend_request_timeout_seconds: float = float(os.getenv("BACKEND_REQUEST_TIMEOUT_SECONDS", "5"))
     backend_students_cache_seconds: float = float(os.getenv("BACKEND_STUDENTS_CACHE_SECONDS", "300"))
 
