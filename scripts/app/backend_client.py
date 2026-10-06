@@ -23,6 +23,29 @@ class AssignmentResult:
     raw: dict[str, Any]
 
 
+@dataclass
+class PlateEntryResult:
+    """Respuesta de POST /api/assignments/plate-entry.
+
+    outcome: ASSIGNED, NOT_REGISTERED, STUDENT_INACTIVE, ALREADY_ASSIGNED o NO_SPACE.
+    Solo ASSIGNED trae los datos del puesto; los demás casos se ignoran.
+    """
+
+    outcome: str
+    plate: str
+    assignment_id: int | None
+    parking_space_id: int | None
+    parking_id: int | None
+    space_number: str | None
+    parking_name: str | None
+    notified: bool
+    raw: dict[str, Any]
+
+    @property
+    def assigned(self) -> bool:
+        return self.outcome == "ASSIGNED"
+
+
 class BackendClient:
     """Sesión contra educore-backend para registrar lo que detecta la cámara.
 
@@ -207,25 +230,36 @@ class BackendClient:
             raw=data,
         )
 
-    def sync_plate_detection(self, plate: str) -> AssignmentResult | None:
-        """Punto de entrada único: placa confirmada -> vehículo -> estudiante -> asignación.
+    def register_plate_entry(self, plate: str, parking_id: int | None = None) -> PlateEntryResult:
+        """Le pasa al backend la placa leída en la entrada.
 
-        Devuelve None si la placa no corresponde a un vehículo activo registrado
-        en el backend (no es un error, simplemente no hay nada que sincronizar).
+        El backend valida el vehículo, evita asignar dos veces al mismo
+        estudiante, elige un puesto libre al azar y le envía el ticket
+        (notificación) al estudiante, todo en una sola transacción.
         """
-        vehicle = self.get_vehicle_by_plate(plate)
-        if not vehicle or not vehicle.get("active", True):
-            return None
-
-        student_code = vehicle.get("studentCode")
-        if not student_code:
-            return None
-
-        student_id = self.find_student_id_by_code(student_code)
-        if student_id is None:
+        response = self._mutating_request(
+            "POST",
+            "/api/assignments/plate-entry",
+            json={"plate": plate.upper(), "parkingId": parking_id},
+        )
+        if response.status_code != 200:
             raise BackendError(
-                f"El vehículo {plate} está asociado al código {student_code}, "
-                "pero no se encontró ese estudiante en el backend"
+                f"El backend rechazó la lectura de la placa {plate} ({response.status_code}): {response.text[:300]}"
             )
+        data = response.json().get("data", {})
+        assignment = data.get("assignment") or {}
+        return PlateEntryResult(
+            outcome=data.get("outcome", ""),
+            plate=data.get("plate", plate.upper()),
+            assignment_id=assignment.get("id"),
+            parking_space_id=assignment.get("parkingSpaceId"),
+            parking_id=assignment.get("parkingId"),
+            space_number=data.get("spaceNumber"),
+            parking_name=data.get("parkingName"),
+            notified=bool(data.get("notified")),
+            raw=data,
+        )
 
-        return self.auto_assign(student_id, self.settings.backend_parking_id)
+    def sync_plate_detection(self, plate: str) -> PlateEntryResult:
+        """Punto de entrada único: placa confirmada en la entrada -> puesto + ticket."""
+        return self.register_plate_entry(plate, self.settings.backend_parking_id)

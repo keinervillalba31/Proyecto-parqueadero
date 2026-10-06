@@ -293,9 +293,10 @@ class VideoService:
             self.state.update_plate({"backend_estado": "error", "backend_error": str(error)})
             return
 
-        if result is None:
+        if not result.assigned:
+            # Placa no registrada, estudiante con puesto activo o sin cupo: se ignora.
             self.state.update_plate(
-                {"backend_estado": "sin_registro_backend", "backend_error": None}
+                {"backend_estado": result.outcome.lower(), "backend_error": None}
             )
             return
 
@@ -305,6 +306,8 @@ class VideoService:
                 "backend_error": None,
                 "backend_asignacion_id": result.assignment_id,
                 "backend_puesto_id": result.parking_space_id,
+                "backend_puesto": result.space_number,
+                "backend_notificado": result.notified,
             }
         )
 

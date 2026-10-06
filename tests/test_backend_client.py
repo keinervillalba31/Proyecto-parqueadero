@@ -185,39 +185,58 @@ def test_auto_assign_raises_on_rejection(client):
         backend.auto_assign(student_id=2)
 
 
-def test_sync_plate_detection_end_to_end(client):
+def test_sync_plate_detection_posts_plate_entry(client):
     backend, session = client
-    session.script["/api/vehicles/plate/ABC123"] = FakeResponse(
-        200, {"success": True, "data": {"plate": "ABC123", "studentCode": "1151002", "active": True}}
-    )
-    session.script["/api/assignments/students"] = FakeResponse(
-        200, {"success": True, "data": [{"id": 2, "studentCode": "1151002", "fullName": "Edinson"}]}
-    )
-    session.script["/api/assignments/auto"] = FakeResponse(
-        201,
-        {"success": True, "data": {"id": 55, "studentId": 2, "parkingSpaceId": 9, "parkingId": 1, "status": "ACTIVE"}},
+    session.script["/api/assignments/plate-entry"] = FakeResponse(
+        200,
+        {
+            "success": True,
+            "data": {
+                "outcome": "ASSIGNED",
+                "plate": "ABC123",
+                "assignment": {"id": 55, "studentId": 2, "parkingSpaceId": 9, "parkingId": 1, "status": "ACTIVE"},
+                "parkingName": "Central",
+                "spaceNumber": "A-07",
+                "zone": "A",
+                "notified": True,
+            },
+        },
     )
 
     result = backend.sync_plate_detection("abc123")
 
-    assert result is not None
+    assert result.assigned
     assert result.assignment_id == 55
+    assert result.parking_space_id == 9
+    assert result.space_number == "A-07"
+    assert result.notified is True
+    method, url, kwargs = session.calls[-1]
+    assert method == "POST"
+    assert kwargs["json"] == {"plate": "ABC123", "parkingId": None}
+    assert kwargs["headers"]["X-XSRF-TOKEN"] == "csrf-token-1"
 
 
-def test_sync_plate_detection_returns_none_when_vehicle_unknown(client):
+@pytest.mark.parametrize("outcome", ["NOT_REGISTERED", "ALREADY_ASSIGNED", "NO_SPACE"])
+def test_sync_plate_detection_reports_ignored_outcomes(client, outcome):
     backend, session = client
-    session.script["/api/vehicles/plate/ZZZ999"] = FakeResponse(404, {})
-
-    assert backend.sync_plate_detection("ZZZ999") is None
-
-
-def test_sync_plate_detection_returns_none_when_vehicle_inactive(client):
-    backend, session = client
-    session.script["/api/vehicles/plate/ABC123"] = FakeResponse(
-        200, {"success": True, "data": {"plate": "ABC123", "studentCode": "1151002", "active": False}}
+    session.script["/api/assignments/plate-entry"] = FakeResponse(
+        200,
+        {"success": True, "data": {"outcome": outcome, "plate": "ZZZ999", "assignment": None, "notified": False}},
     )
 
-    assert backend.sync_plate_detection("ABC123") is None
+    result = backend.sync_plate_detection("ZZZ999")
+
+    assert not result.assigned
+    assert result.outcome == outcome
+    assert result.assignment_id is None
+
+
+def test_sync_plate_detection_raises_on_rejection(client):
+    backend, session = client
+    session.script["/api/assignments/plate-entry"] = FakeResponse(403, {}, text="forbidden")
+
+    with pytest.raises(BackendError):
+        backend.sync_plate_detection("ABC123")
 
 
 def test_request_relogs_in_once_on_401(client):
