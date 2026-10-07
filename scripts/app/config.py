@@ -33,6 +33,10 @@ def video_source_from_env(default: str) -> str:
     return resolve_source(os.getenv("VIDEO_SOURCE", default))
 
 
+def plate_video_source_from_env() -> str:
+    return resolve_source(os.getenv("PLATE_VIDEO_SOURCE", ""))
+
+
 def video_fallback_from_env() -> str:
     return resolve_source(os.getenv("VIDEO_FALLBACK", ""))
 
@@ -45,6 +49,7 @@ class Settings:
         "REGISTERED_VEHICLES", SCRIPT_DIR / "vehiculos_registrados.json"
     )
     video_source: str = video_source_from_env("0")
+    plate_video_source: str = plate_video_source_from_env()
     yolo_confidence: float = float(os.getenv("YOLO_CONFIDENCE", "0.15"))
     yolo_image_size: int = int(os.getenv("YOLO_IMAGE_SIZE", "960"))
     yolo_tile_grid: int = int(os.getenv("YOLO_TILE_GRID", "2"))

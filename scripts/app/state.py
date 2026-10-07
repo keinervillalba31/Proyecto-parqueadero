@@ -20,7 +20,13 @@ class RuntimeState:
             "congestion_porcentaje": 0.0,
             "celdas": {},
             "reservas": {},
-            "fuente": {"modo": "iniciando", "origen": None, "respaldo": None},
+            "fuente": {
+                "modo": "iniciando",
+                "origen": None,
+                "respaldo": None,
+                "placas_origen": None,
+                "placas_error": None,
+            },
             # Cuadros por segundo del video en vivo y de los análisis de YOLO.
             "rendimiento": {"fps_video": 0.0, "fps_analisis": 0.0},
             "placa": {

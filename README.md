@@ -35,7 +35,10 @@ Todos los comandos se ejecutan desde `Proyecto-parqueadero`.
 
 El administrador traza las celdas **desde la plataforma web**, sin tocar este servicio:
 
-1. En **Monitoreo**, registra la cámara con la URL de transmisión `http://<este-servidor>:8000/video`.
+1. En **Monitoreo**, registra la cámara del parqueadero con la URL
+   `http://<este-servidor>:8000/video/parqueadero`.
+   Si el servicio de placas usa otra cámara, registra esa cámara con
+   `http://<este-servidor>:8000/video/placas` y configura su fuente con `PLATE_VIDEO_SOURCE`.
 2. En su tarjeta pulsa **Trazar celdas**: se abre una imagen limpia de la cámara (`GET /snapshot`).
    Con **+ Trazar celdas** marca las 4 esquinas de cada puesto, y a cada celda le asigna el puesto real
    del parqueadero (A-01, N-03...). Las esquinas se pueden arrastrar para ajustarlas. **Guardar celdas**.
@@ -101,6 +104,12 @@ reciente, descartando los intermedios si no da abasto, y dibuja su último resul
 sobre cada cuadro nuevo. Así el video nunca se atrasa, aunque el análisis sea más
 lento. `GET /estado` → `rendimiento` muestra `fps_video` y `fps_analisis`.
 
+El video del parqueadero está disponible en `/video/parqueadero` (y `/video` se
+conserva como alias). Para separar la cámara de placas, define `PLATE_VIDEO_SOURCE`;
+el servicio la captura en un hilo propio, lee placas de cuadros completos y expone
+ese flujo en `/video/placas`. Si no se configura, las placas siguen leyéndose desde
+`VIDEO_SOURCE` como antes.
+
 Medido en un equipo sin GPU (video de 1280x720):
 
 | `YOLO_TILE_GRID` | Video | Análisis de YOLO |
@@ -144,7 +153,8 @@ Las pruebas simulan YOLO, así que no necesitan GPU ni video.
 ## Endpoints
 
 - `GET /snapshot`: cuadro actual sin dibujos (la plataforma lo usa para trazar celdas).
-- `GET /video`: video anotado en vivo (verde = libre, rojo = ocupado, amarillo = reservado).
+- `GET /video/parqueadero` (`/video`): video en vivo del parqueadero.
+- `GET /video/placas`: video en vivo de la fuente independiente de placas (`PLATE_VIDEO_SOURCE`).
 - `GET /espacios/estado`: ocupación de las celdas y reservas.
 - `GET /placas/estado`: última lectura y estado de la placa.
 - `GET /reservas`: celdas asignadas a placas registradas.

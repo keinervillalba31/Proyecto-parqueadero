@@ -23,6 +23,7 @@ def make_service(detector, detections=()) -> VideoService:
         reservation_timeout_seconds=600,
         plate_require_vehicle=True,
         plate_interval_frames=10_000,
+        plate_video_source="",
         plate_crop_vehicles=True,
         plate_max_vehicles=3,
         plate_min_crop_width=1,
@@ -33,6 +34,9 @@ def make_service(detector, detections=()) -> VideoService:
     service.reservations = {}
     service.reservations_lock = threading.Lock()
     service.frame_lock = threading.Lock()
+    service.plate_frame_lock = threading.Lock()
+    service.latest_plate_frame = None
+    service.latest_plate_frame_id = 0
     service.overlay = None
     service.latest_frame = None
     service.latest_frame_id = 0
@@ -91,6 +95,20 @@ def test_publish_frame_streams_original_without_cell_overlay(make_detector):
     _, encoded = service.state.get_frame()
     published = cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_COLOR)
     assert np.array_equal(published, frame)
+
+
+def test_publish_plate_frame_is_independent_from_parking_stream(make_detector):
+    service = make_service(make_detector())
+    plate_frame = np.full((120, 220, 3), 255, dtype=np.uint8)
+
+    service._publish_plate_frame(plate_frame)
+
+    plate_id, plate_encoded = service.get_plate_frame()
+    parking_id, parking_encoded = service.state.get_frame()
+    assert plate_id == 1
+    assert plate_encoded is not None
+    assert parking_id == 0
+    assert parking_encoded is None
 
 
 def test_process_detection_clears_a_previous_detector_error(make_detector):

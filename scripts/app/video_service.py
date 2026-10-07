@@ -58,8 +58,12 @@ class VideoService:
         self.frame_lock = threading.Lock()
         self.latest_frame: np.ndarray | None = None
         self.latest_frame_id = 0
+        self.plate_frame_lock = threading.Lock()
+        self.latest_plate_frame: bytes | None = None
+        self.latest_plate_frame_id = 0
         self.overlay: tuple[Any, ...] | None = None
         self.detect_thread: threading.Thread | None = None
+        self.plate_video_thread: threading.Thread | None = None
         self.cells_thread: threading.Thread | None = None
         self.cells_version: str | None = None
         self.occupancy_thread: threading.Thread | None = None
@@ -103,10 +107,21 @@ class VideoService:
         )
         self.thread.start()
         self.detect_thread.start()
+        if self.settings.plate_video_source:
+            self.plate_video_thread = threading.Thread(
+                target=self._run_plate_video, name="plate-video-worker", daemon=True
+            )
+            self.plate_video_thread.start()
 
     def stop(self) -> None:
         self.running = False
-        for worker in (self.thread, self.detect_thread, self.cells_thread, self.occupancy_thread):
+        for worker in (
+            self.thread,
+            self.detect_thread,
+            self.plate_video_thread,
+            self.cells_thread,
+            self.occupancy_thread,
+        ):
             if worker and worker is not threading.current_thread():
                 worker.join(timeout=2)
         with self.probe_lock:
@@ -453,6 +468,81 @@ class VideoService:
             self.state.set_frame(encoded.tobytes())
         self._count_video_frame()
 
+    def _publish_plate_frame(self, frame: np.ndarray) -> None:
+        encoded_ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        if not encoded_ok:
+            raise RuntimeError("No se pudo codificar un cuadro del video de placas")
+        with self.plate_frame_lock:
+            self.latest_plate_frame = encoded.tobytes()
+            self.latest_plate_frame_id += 1
+
+    def get_plate_frame(self) -> tuple[int, bytes | None]:
+        with self.plate_frame_lock:
+            return self.latest_plate_frame_id, self.latest_plate_frame
+
+    def _run_plate_video(self) -> None:
+        """Captura un flujo independiente para transmitirlo y leer sus placas."""
+        source = self.settings.plate_video_source
+        capture: cv2.VideoCapture | None = None
+        interval = 0.0
+        frame_number = 0
+        next_frame_at = 0.0
+        self.state.update_source({"placas_origen": source, "placas_error": None})
+
+        while self.running:
+            try:
+                if capture is None or not capture.isOpened():
+                    if capture is not None:
+                        capture.release()
+                    capture = self._open_capture(source)
+                    if Path(source).is_file():
+                        fps = capture.get(cv2.CAP_PROP_FPS)
+                        interval = 1.0 / fps if fps and 1 <= fps <= 120 else 1.0 / 25
+                    else:
+                        interval = 0.0
+                    next_frame_at = 0.0
+                    self.state.update_source({"placas_error": None})
+
+                if interval > 0:
+                    now = time.monotonic()
+                    if next_frame_at == 0.0 or now - next_frame_at > 1.0:
+                        next_frame_at = now
+                    wait = next_frame_at - now
+                    if wait > 0:
+                        time.sleep(wait)
+                    next_frame_at += interval
+
+                ok, frame = capture.read()
+                if not ok and Path(source).is_file():
+                    capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ok, frame = capture.read()
+                if not ok:
+                    raise RuntimeError("La fuente de placas dejó de entregar cuadros")
+
+                self._publish_plate_frame(frame)
+                frame_number += 1
+                if (
+                    frame_number % max(self.settings.plate_interval_frames, 1) == 0
+                    and (self.plate_thread is None or not self.plate_thread.is_alive())
+                ):
+                    self.plate_thread = threading.Thread(
+                        target=self._read_plate,
+                        args=([frame.copy()],),
+                        name="plate-reader",
+                        daemon=True,
+                    )
+                    self.plate_thread.start()
+            except Exception as error:
+                self.state.update_source({"placas_error": str(error)})
+                log.exception("Falló el flujo de video de placas")
+                if capture is not None:
+                    capture.release()
+                    capture = None
+                time.sleep(self.settings.video_retry_seconds)
+
+        if capture is not None:
+            capture.release()
+
     def _count_video_frame(self) -> None:
         self.video_frames += 1
         now = time.monotonic()
@@ -537,7 +627,7 @@ class VideoService:
             self.overlay = (vehicles, parking_state, reserved)
 
         vehicle_detected = parking_state["vehiculos_detectados"] > 0
-        if self._plate_attempt_allowed(vehicle_detected) and (
+        if not self.settings.plate_video_source and self._plate_attempt_allowed(vehicle_detected) and (
             self.plate_thread is None or not self.plate_thread.is_alive()
         ):
             images = self._plate_images(frame)
