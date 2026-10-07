@@ -20,12 +20,25 @@ class RuntimeState:
             "congestion_porcentaje": 0.0,
             "celdas": {},
             "reservas": {},
+            "fuente": {
+                "modo": "iniciando",
+                "origen": None,
+                "respaldo": None,
+                "placas_origen": None,
+                "placas_error": None,
+            },
+            # Cuadros por segundo del video en vivo y de los análisis de YOLO.
+            "rendimiento": {"fps_video": 0.0, "fps_analisis": 0.0},
             "placa": {
                 "valor": None,
                 "lecturas": [],
                 "estado": "esperando",
                 "ultimo_intento": None,
                 "error": None,
+                "backend_estado": "deshabilitado",
+                "backend_error": None,
+                "backend_asignacion_id": None,
+                "backend_puesto_id": None,
             },
         }
 
@@ -37,7 +50,18 @@ class RuntimeState:
         """Actualiza la ocupación sin tocar la placa, que la escribe otro hilo."""
         with self.lock:
             placa = self.data["placa"]
-            self.data = {**data, "placa": placa}
+            fuente = self.data["fuente"]
+            rendimiento = self.data["rendimiento"]
+            self.data = {**data, "placa": placa, "fuente": fuente, "rendimiento": rendimiento}
+
+    def update_performance(self, changes: dict[str, Any]) -> None:
+        with self.lock:
+            self.data["rendimiento"] = {**self.data["rendimiento"], **changes}
+
+    def update_source(self, changes: dict[str, Any]) -> None:
+        """Indica qué fuente de video se está usando (cámara o video de respaldo)."""
+        with self.lock:
+            self.data["fuente"] = {**self.data["fuente"], **changes}
 
     def update_plate(self, changes: dict[str, Any], replace: bool = False) -> None:
         """Mezcla los cambios con la placa actual de forma atómica."""

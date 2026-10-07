@@ -10,6 +10,7 @@ lee las placas con Roboflow y asigna una celda libre a los vehículos registrado
 - `scripts/app/parking_detector.py`: usa YOLO para detectar vehículos y marcar las celdas ocupadas o libres, con suavizado entre cuadros.
 - `scripts/app/plate_reader.py`: envía capturas a Roboflow y confirma la placa con varias lecturas.
 - `scripts/app/video_service.py`: coordina el video, el detector, el lector de placas y las reservas de celdas.
+- `scripts/app/backend_client.py`: cuando una placa registrada se confirma, le pide a `educore-backend` que asigne y guarde el puesto (ver "Sincronización con el backend").
 - `scripts/app/main.py`: expone la API con FastAPI.
 - `scripts/api_video.py`: punto de entrada compatible con el comando anterior.
 
@@ -29,6 +30,26 @@ Todas las rutas relativas del `.env` se toman desde la raíz del proyecto.
 ## Uso
 
 Todos los comandos se ejecutan desde `Proyecto-parqueadero`.
+
+### 0. Celdas trazadas desde la plataforma (recomendado)
+
+El administrador traza las celdas **desde la plataforma web**, sin tocar este servicio:
+
+1. En **Monitoreo**, registra la cámara del parqueadero con la URL
+   `http://<este-servidor>:8000/video/parqueadero`.
+   Si el servicio de placas usa otra cámara, registra esa cámara con
+   `http://<este-servidor>:8000/video/placas` y configura su fuente con `PLATE_VIDEO_SOURCE`.
+2. En su tarjeta pulsa **Trazar celdas**: se abre una imagen limpia de la cámara (`GET /snapshot`).
+   Con **+ Trazar celdas** marca las 4 esquinas de cada puesto, y a cada celda le asigna el puesto real
+   del parqueadero (A-01, N-03...). Las esquinas se pueden arrastrar para ajustarlas. **Guardar celdas**.
+3. En el `.env` de este servicio pon `BACKEND_SYNC_ENABLED=true` y `BACKEND_CAMERA_ID=<id de la cámara>`.
+
+El servicio trae esas celdas del backend al arrancar y **revisa cada `BACKEND_CELLS_POLL_SECONDS` si
+cambiaron**, así que ajustar o agregar celdas no requiere reiniciar nada. Las coordenadas se guardan
+relativas al tamaño de la imagen, por eso siguen valiendo si cambia la resolución. `GET /estado` indica en
+`fuente.celdas_origen` si se usan celdas de la `plataforma` o las `local`, y cada celda trae el
+`puesto` al que está vinculada. Si la plataforma aún no tiene celdas para la cámara, se usa el archivo
+local del paso siguiente.
 
 ### 1. Configurar las celdas
 
@@ -53,9 +74,50 @@ video, y si la proporción no coincide se muestra una advertencia.
 
 ### 2. Ejecutar el servicio
 
+Un solo comando; al encender ya queda leyendo video, detectando y sincronizando:
+
 ```powershell
-python -m uvicorn api_video:app --app-dir scripts --host 0.0.0.0 --port 8000
+python run_service.py
 ```
+
+(El comando anterior, `python -m uvicorn api_video:app --app-dir scripts ...`, sigue funcionando.)
+
+**Cámara con video de respaldo.** Pon la cámara en `VIDEO_SOURCE` (por ejemplo
+`rtsp://usuario:clave@192.168.1.20/stream`) y un video corto en `VIDEO_FALLBACK`.
+Si la cámara no responde, el servicio reproduce ese video en bucle sin parar y
+reintenta la cámara cada `VIDEO_CAMERA_RETRY_SECONDS`; cuando responde, cambia a
+ella solo. Si la cámara se cae después, vuelve al respaldo. La fuente en uso
+aparece en `GET /estado` → `fuente.modo` (`principal` o `respaldo`) y en `GET /health`.
+
+**Arranque automático en Windows** (sin abrir consola ni ejecutar nada), con el
+Programador de tareas; se reinicia solo si falla:
+
+```powershell
+.\scripts\windows\servicio.ps1 instalar        # arranca al iniciar sesión
+.\scripts\windows\servicio.ps1 instalar -AlEncender   # como administrador: arranca al encender el equipo
+.\scripts\windows\servicio.ps1 iniciar | detener | estado | desinstalar
+```
+
+**Tiempo real.** El video y la detección corren en hilos separados: `/video` entrega
+el video a su velocidad real (~24 cuadros/s) y YOLO analiza siempre el cuadro más
+reciente, descartando los intermedios si no da abasto, y dibuja su último resultado
+sobre cada cuadro nuevo. Así el video nunca se atrasa, aunque el análisis sea más
+lento. `GET /estado` → `rendimiento` muestra `fps_video` y `fps_analisis`.
+
+El video del parqueadero está disponible en `/video/parqueadero` (y `/video` se
+conserva como alias). Para separar la cámara de placas, define `PLATE_VIDEO_SOURCE`;
+el servicio la captura en un hilo propio, lee placas de cuadros completos y expone
+ese flujo en `/video/placas`. Si no se configura, las placas siguen leyéndose desde
+`VIDEO_SOURCE` como antes.
+
+Medido en un equipo sin GPU (video de 1280x720):
+
+| `YOLO_TILE_GRID` | Video | Análisis de YOLO |
+|---|---|---|
+| 2 (máxima precisión) | ~24 cuadros/s | ~1 por segundo |
+| 1 | ~24 cuadros/s | ~4-5 por segundo |
+
+Con una GPU el análisis sube a decenas por segundo y se puede usar `YOLO_TILE_GRID=2`.
 
 Luego abre http://localhost:8000/video para ver el video anotado o http://localhost:8000/docs para probar la API.
 Si `VIDEO_SOURCE` es un archivo, el video se repite en bucle.
@@ -90,7 +152,9 @@ Las pruebas simulan YOLO, así que no necesitan GPU ni video.
 
 ## Endpoints
 
-- `GET /video`: video anotado en vivo (verde = libre, rojo = ocupado, amarillo = reservado).
+- `GET /snapshot`: cuadro actual sin dibujos (la plataforma lo usa para trazar celdas).
+- `GET /video/parqueadero` (`/video`): video en vivo del parqueadero.
+- `GET /video/placas`: video en vivo de la fuente independiente de placas (`PLATE_VIDEO_SOURCE`).
 - `GET /espacios/estado`: ocupación de las celdas y reservas.
 - `GET /placas/estado`: última lectura y estado de la placa.
 - `GET /reservas`: celdas asignadas a placas registradas.
@@ -115,6 +179,40 @@ Las pruebas simulan YOLO, así que no necesitan GPU ni video.
 4. Si la placa está en `vehiculos_registrados.json`, se le reserva la primera celda libre.
    La reserva se libera cuando el vehículo se estaciona y luego sale, o después de
    `RESERVATION_TIMEOUT_SECONDS` si nunca llegó a ocuparla.
+5. Si `BACKEND_SYNC_ENABLED=true`, la misma placa confirmada se envía además a
+   `educore-backend` para que quede guardada de verdad (no solo en memoria local).
+
+## Sincronización con el backend
+
+Además de la reserva local (en memoria, para la vista en vivo), el servicio puede
+pedirle a `educore-backend` que haga y guarde la asignación real:
+
+1. Se autentica como una cuenta de servicio (un usuario con rol **Operador**, que
+   ya tiene los permisos `ASSIGNMENTS_MANAGE` y `PLATES_VIEW`).
+2. Con la placa confirmada, busca el vehículo (`GET /api/vehicles/plate/{placa}`).
+3. Si el vehículo está activo, busca el id del estudiante dueño por su código
+   (`GET /api/assignments/students`).
+4. Le pide al backend el espacio y lo guarda (`POST /api/assignments/auto`).
+
+Esto corre en un hilo aparte (`backend-sync`): si el backend no responde o la
+placa no está registrada allá, el video y la lectura de placas siguen igual —
+nunca se bloquean por esto. El resultado (sincronizado, error, o la placa no
+existe en el backend) queda en `GET /placas/estado` → `backend_estado`.
+
+Para activarlo, en `.env`:
+
+```
+BACKEND_SYNC_ENABLED=true
+BACKEND_BASE_URL=http://localhost:8080
+BACKEND_SERVICE_USER_CODE=OP001
+BACKEND_SERVICE_IDENTITY_DOCUMENT=<documento del operador>
+BACKEND_SERVICE_PASSWORD=<contraseña del operador>
+BACKEND_PARKING_ID=   # vacío = cualquier parqueadero con espacio libre
+```
+
+> Nota: el backend invalida la cookie CSRF en cuanto se hace cualquier petición
+> GET, así que `backend_client.py` vuelve a pedirla justo antes de cada POST
+> (el mismo motivo por el que el frontend también la reintenta).
 
 ### Formato de `vehiculos_registrados.json`
 

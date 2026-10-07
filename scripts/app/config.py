@@ -21,13 +21,24 @@ def project_path(variable: str, default: Path) -> Path:
     return path if path.is_absolute() else PROJECT_DIR / path
 
 
-def video_source_from_env(default: str) -> str:
+def resolve_source(value: str) -> str:
     """Índice de cámara, URL o ruta de archivo (relativa a la raíz del proyecto)."""
-    value = os.getenv("VIDEO_SOURCE", default)
     if not value or value.isdigit() or "://" in value:
         return value
     path = Path(value)
     return str(path if path.is_absolute() else PROJECT_DIR / path)
+
+
+def video_source_from_env(default: str) -> str:
+    return resolve_source(os.getenv("VIDEO_SOURCE", default))
+
+
+def plate_video_source_from_env() -> str:
+    return resolve_source(os.getenv("PLATE_VIDEO_SOURCE", ""))
+
+
+def video_fallback_from_env() -> str:
+    return resolve_source(os.getenv("VIDEO_FALLBACK", ""))
 
 
 @dataclass(frozen=True)
@@ -38,6 +49,7 @@ class Settings:
         "REGISTERED_VEHICLES", SCRIPT_DIR / "vehiculos_registrados.json"
     )
     video_source: str = video_source_from_env("0")
+    plate_video_source: str = plate_video_source_from_env()
     yolo_confidence: float = float(os.getenv("YOLO_CONFIDENCE", "0.15"))
     yolo_image_size: int = int(os.getenv("YOLO_IMAGE_SIZE", "960"))
     yolo_tile_grid: int = int(os.getenv("YOLO_TILE_GRID", "2"))
@@ -58,8 +70,42 @@ class Settings:
     plate_min_crop_width: int = int(os.getenv("PLATE_MIN_CROP_WIDTH", "120"))
     plate_skip_parked: bool = os.getenv("PLATE_SKIP_PARKED", "true").lower() == "true"
     video_retry_seconds: float = float(os.getenv("VIDEO_RETRY_SECONDS", "2"))
+    # Video que se repite en bucle mientras la cámara principal no responde.
+    video_fallback: str = video_fallback_from_env()
+    # Cada cuántos segundos se reintenta la cámara principal mientras se usa el respaldo.
+    video_camera_retry_seconds: float = float(os.getenv("VIDEO_CAMERA_RETRY_SECONDS", "10"))
+    service_host: str = os.getenv("SERVICE_HOST", "0.0.0.0")
+    service_port: int = int(os.getenv("SERVICE_PORT", "8000"))
     roboflow_workspace: str = os.getenv("ROBOFLOW_WORKSPACE", "")
     roboflow_workflow: str = os.getenv("ROBOFLOW_WORKFLOW", "")
+
+    # --- Sincronización con el backend (educore-backend) ---
+    # Cuando una placa se confirma y está registrada, además de reservar la
+    # celda localmente se le pide al backend que asigne y guarde el espacio.
+    backend_sync_enabled: bool = os.getenv("BACKEND_SYNC_ENABLED", "false").lower() == "true"
+    backend_base_url: str = os.getenv("BACKEND_BASE_URL", "http://localhost:8080")
+    # Cuenta de servicio: un usuario con rol que tenga ASSIGNMENTS_MANAGE y
+    # PLATES_VIEW (el rol Operador ya los tiene).
+    backend_service_user_code: str = os.getenv("BACKEND_SERVICE_USER_CODE", "")
+    backend_service_identity_document: str = os.getenv("BACKEND_SERVICE_IDENTITY_DOCUMENT", "")
+    backend_service_password: str = os.getenv("BACKEND_SERVICE_PASSWORD", "")
+    # Id del parqueadero de esta cámara en el backend (opcional; vacío = cualquiera).
+    backend_parking_id: int | None = (
+        int(os.getenv("BACKEND_PARKING_ID")) if os.getenv("BACKEND_PARKING_ID") else None
+    )
+    # Id de esta cámara en la plataforma. Si se define, las celdas se toman de ahí
+    # (las traza el administrador desde Monitoreo) y se recargan solas al cambiar.
+    backend_camera_id: int | None = (
+        int(os.getenv("BACKEND_CAMERA_ID")) if os.getenv("BACKEND_CAMERA_ID") else None
+    )
+    backend_cells_poll_seconds: float = float(os.getenv("BACKEND_CELLS_POLL_SECONDS", "15"))
+    # Cada cuánto se revisa si cambió la ocupación de las celdas para enviarla al backend.
+    # Aunque no cambie, se reenvía cada BACKEND_OCCUPANCY_RESEND_SECONDS por si el backend
+    # se reinició o alguien cambió un puesto a mano.
+    backend_occupancy_report_seconds: float = float(os.getenv("BACKEND_OCCUPANCY_REPORT_SECONDS", "2"))
+    backend_occupancy_resend_seconds: float = float(os.getenv("BACKEND_OCCUPANCY_RESEND_SECONDS", "60"))
+    backend_request_timeout_seconds: float = float(os.getenv("BACKEND_REQUEST_TIMEOUT_SECONDS", "5"))
+    backend_students_cache_seconds: float = float(os.getenv("BACKEND_STUDENTS_CACHE_SECONDS", "300"))
 
 
 settings = Settings()

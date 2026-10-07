@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
 import cv2
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
 from .config import settings
 from .video_service import VideoService
@@ -87,21 +88,48 @@ def read_license_plates(image: UploadFile = File(...)) -> dict[str, Any]:
     return {"plate": plate, "registered": plate in service.registered_vehicles if plate else False}
 
 
-@app.get("/video")
-def video_stream() -> StreamingResponse:
+@app.get("/snapshot")
+def snapshot() -> Response:
+    """Cuadro actual sin dibujos (para trazar celdas desde la plataforma)."""
+    image = service.snapshot_jpeg()
+    if image is None:
+        raise HTTPException(status_code=503, detail="Aún no hay imagen de la cámara")
+    return Response(content=image, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+def _mjpeg_stream(
+    get_frame: Callable[[], tuple[int, bytes | None]],
+) -> StreamingResponse:
     def frames():
         last_id = -1
         while True:
-            frame_id, frame = service.state.get_frame()
-            # Solo se envía el cuadro cuando el hilo de video produjo uno nuevo.
+            frame_id, frame = get_frame()
             if frame is not None and frame_id != last_id:
                 last_id = frame_id
                 yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
-            time.sleep(0.04)
+            time.sleep(0.01)
 
     return StreamingResponse(
         frames(), media_type="multipart/x-mixed-replace; boundary=frame"
     )
+
+
+@app.get("/video")
+@app.get("/video/parqueadero")
+def parking_video_stream() -> StreamingResponse:
+    return _mjpeg_stream(service.state.get_frame)
+
+
+@app.get("/video/placas")
+def plate_video_stream() -> StreamingResponse:
+    if not service.settings.plate_video_source:
+        raise HTTPException(
+            status_code=503,
+            detail="No se configuró PLATE_VIDEO_SOURCE para el video de placas",
+        )
+    if service.get_plate_frame()[1] is None:
+        raise HTTPException(status_code=503, detail="Aún no hay imagen de la cámara de placas")
+    return _mjpeg_stream(service.get_plate_frame)
 
 
 @app.websocket("/ws/estado")
