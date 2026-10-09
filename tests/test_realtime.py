@@ -142,3 +142,30 @@ def test_pace_does_not_slow_down_a_live_camera(make_detector):
         service._pace(0.0)
 
     assert time.monotonic() - started < 0.1
+
+
+def test_plate_camera_without_vehicle_does_not_call_the_ocr(make_detector):
+    detector = make_detector()
+    service = make_service(detector, detections=[])
+    service.plate_vehicle_detector = detector.vehicles
+    sent = []
+    service._read_plate = sent.append
+
+    service._read_plate_video_frame(blank_frame())
+
+    assert sent == [], "sin vehículo no se gasta una llamada a Roboflow"
+    assert service.state.snapshot()["placa"]["estado"] == "sin_vehiculo"
+
+
+def test_plate_camera_sends_one_crop_per_vehicle(make_detector):
+    detector = make_detector()
+    service = make_service(detector, detections=[CAR_IN_CELL_1])
+    service.plate_vehicle_detector = detector.vehicles
+    sent = []
+    service._read_plate = sent.append
+
+    service._read_plate_video_frame(blank_frame())
+
+    assert len(sent) == 1
+    (crop,) = sent[0]
+    assert crop.shape[:2] != blank_frame().shape[:2], "se envía el recorte, no el cuadro completo"

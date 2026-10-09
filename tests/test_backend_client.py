@@ -256,3 +256,50 @@ def test_request_relogs_in_once_on_401(client):
 
     assert vehicle["plate"] == "ABC123"
     assert session.login_attempts == 1
+
+
+def test_concurrent_threads_never_send_a_stale_csrf_token(client):
+    """El backend cambia la cookie CSRF en cada petición; dos hilos cruzados daban 403."""
+    import threading
+    import time
+
+    backend, session = client
+    counter = iter(range(1_000_000))
+    mismatches = []
+
+    def rotate_cookie():
+        time.sleep(0.001)  # agranda la ventana en la que otro hilo podría colarse
+        session.cookies["XSRF-TOKEN"] = f"csrf-{next(counter)}"
+
+    def fake_get(url: str, **kwargs: Any) -> FakeResponse:
+        rotate_cookie()
+        return FakeResponse(200, {})
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        time.sleep(0.002)  # viaje de red: aquí otro hilo podía cambiar la cookie
+        if method == "POST" and kwargs["headers"]["X-XSRF-TOKEN"] != session.cookies["XSRF-TOKEN"]:
+            mismatches.append(url)
+        rotate_cookie()
+        return FakeResponse(200, {"data": {"outcome": "NO_SPACE", "version": "", "cells": []}})
+
+    session.get = fake_get
+    session.request = fake_request
+    backend._logged_in = True
+
+    def report_occupancy():
+        for _ in range(30):
+            backend.report_occupancy(4, {1: True})
+
+    def poll_cells():
+        for _ in range(30):
+            backend.get_camera_cells(4)
+
+    workers = [threading.Thread(target=report_occupancy), threading.Thread(target=poll_cells)]
+    for worker in workers:
+        worker.start()
+    for _ in range(30):
+        backend.sync_plate_detection("ABC123")
+    for worker in workers:
+        worker.join()
+
+    assert mismatches == []

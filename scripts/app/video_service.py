@@ -12,7 +12,7 @@ import numpy as np
 
 from .backend_client import BackendClient, BackendError
 from .config import Settings
-from .parking_detector import ParkingDetector
+from .parking_detector import ParkingDetector, VehicleDetector
 from .plate_reader import PlateReader, vehicle_crops
 from .state import RuntimeState
 
@@ -64,6 +64,7 @@ class VideoService:
         self.overlay: tuple[Any, ...] | None = None
         self.detect_thread: threading.Thread | None = None
         self.plate_video_thread: threading.Thread | None = None
+        self.plate_vehicle_detector: VehicleDetector | None = None
         self.cells_thread: threading.Thread | None = None
         self.cells_version: str | None = None
         self.occupancy_thread: threading.Thread | None = None
@@ -480,6 +481,42 @@ class VideoService:
         with self.plate_frame_lock:
             return self.latest_plate_frame_id, self.latest_plate_frame
 
+    def _plate_video_images(self, frame: np.ndarray) -> list[np.ndarray]:
+        """Recorta los vehículos de la cámara de placas, como `probar_placas.py`.
+
+        Tiene su propio YOLO porque el del parqueadero lo usa otro hilo. Si no
+        hay ningún vehículo no se devuelve nada y así no se gasta una llamada a
+        Roboflow.
+        """
+        if not self.settings.plate_crop_vehicles:
+            return [frame]
+        if self.plate_vehicle_detector is None:
+            self.plate_vehicle_detector = VehicleDetector(
+                model_path=self.settings.model_path,
+                confidence=self.settings.yolo_confidence,
+                image_size=self.settings.yolo_image_size,
+                tile_grid=self.settings.yolo_tile_grid,
+                minimum_box_area=self.settings.minimum_box_area,
+                minimum_motorcycle_area=self.settings.minimum_motorcycle_area,
+            )
+        return vehicle_crops(
+            frame,
+            self.plate_vehicle_detector.detect(frame),
+            max_vehicles=self.settings.plate_max_vehicles,
+            minimum_width=self.settings.plate_min_crop_width,
+        )
+
+    def _read_plate_video_frame(self, frame: np.ndarray) -> None:
+        try:
+            images = self._plate_video_images(frame)
+        except Exception as error:
+            self.state.update_plate({"estado": "error_lectura", "error": str(error)})
+            return
+        if not images:
+            self.state.update_plate({"estado": "sin_vehiculo"})
+            return
+        self._read_plate(images)
+
     def _run_plate_video(self) -> None:
         """Captura un flujo independiente para transmitirlo y leer sus placas."""
         source = self.settings.plate_video_source
@@ -526,8 +563,8 @@ class VideoService:
                     and (self.plate_thread is None or not self.plate_thread.is_alive())
                 ):
                     self.plate_thread = threading.Thread(
-                        target=self._read_plate,
-                        args=([frame.copy()],),
+                        target=self._read_plate_video_frame,
+                        args=(frame.copy(),),
                         name="plate-reader",
                         daemon=True,
                     )
