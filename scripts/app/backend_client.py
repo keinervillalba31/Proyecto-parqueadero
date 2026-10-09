@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -57,6 +58,10 @@ class BackendClient:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.session = requests.Session()
+        # Los hilos de ocupación, celdas y placas comparten la sesión, y el
+        # backend cambia la cookie CSRF en cada petición: si dos hilos se
+        # cruzan, el POST sale con un token viejo y el backend responde 403.
+        self._lock = threading.RLock()
         self._logged_in = False
         self._students_cache: list[dict[str, Any]] = []
         self._students_cache_at: float = 0.0
@@ -107,6 +112,10 @@ class BackendClient:
             self.login()
 
     def _request(self, method: str, path: str, *, retry: bool = True, **kwargs: Any) -> requests.Response:
+        with self._lock:
+            return self._request_unlocked(method, path, retry=retry, **kwargs)
+
+    def _request_unlocked(self, method: str, path: str, *, retry: bool, **kwargs: Any) -> requests.Response:
         self._ensure_login()
         try:
             response = self.session.request(
@@ -131,13 +140,14 @@ class BackendClient:
         # petición GET (el mismo comportamiento por el que el front tiene su
         # propio reintento): hay que pedirla de nuevo justo antes de usarla,
         # no basta con la que quedó del login.
-        self._ensure_login()
-        try:
-            self._fetch_csrf()
-        except requests.RequestException as error:
-            raise BackendError(f"No se pudo refrescar el token CSRF: {error}") from error
-        headers = {"X-XSRF-TOKEN": self._csrf_token() or ""}
-        return self._request(method, path, json=json, headers=headers)
+        with self._lock:
+            self._ensure_login()
+            try:
+                self._fetch_csrf()
+            except requests.RequestException as error:
+                raise BackendError(f"No se pudo refrescar el token CSRF: {error}") from error
+            headers = {"X-XSRF-TOKEN": self._csrf_token() or ""}
+            return self._request(method, path, json=json, headers=headers)
 
     # -- consultas ----------------------------------------------------------
 
