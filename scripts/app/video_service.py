@@ -10,7 +10,7 @@ from typing import Any
 import cv2
 import numpy as np
 
-from .backend_client import BackendClient, BackendError
+from .backend_client import BackendClient, BackendError, PlateEntryResult
 from .config import Settings
 from .parking_detector import ParkingDetector, VehicleDetector
 from .plate_reader import PlateReader, vehicle_crops
@@ -61,6 +61,8 @@ class VideoService:
         self.reservations: dict[str, dict[str, Any]] = {}
         self.reservations_lock = threading.Lock()
         self.plate_thread: threading.Thread | None = None
+        # placa -> hasta cuándo no se vuelve a consultar al backend por su primera lectura.
+        self.first_read_checks: dict[str, float] = {}
         self.vehicle_was_detected = False
         self.frame_number = 0
         self.thread: threading.Thread | None = None
@@ -372,7 +374,48 @@ class VideoService:
             skip_parked=self.settings.plate_skip_parked,
         )
 
-    def _publish_confirmed(self, plate: str, read_count: int, last_read: str) -> None:
+    def _check_first_read(self, plate: str) -> threading.Thread | None:
+        """Primera lectura de una placa: se le pregunta de una vez al backend si la conoce.
+
+        Si es de un estudiante, eso ya la confirma y no se espera a repetir la
+        lectura (que es lo que más demora). Corre en su propio hilo para no
+        frenar la lectura; si el backend no la conoce, la confirmación por
+        lecturas repetidas sigue su curso. Cada placa se consulta una sola vez
+        por PLATE_COOLDOWN_SECONDS.
+        """
+        if not self.backend or self.plates.in_cooldown(plate):
+            return None
+        now = time.monotonic()
+        self.first_read_checks = {
+            read: until for read, until in self.first_read_checks.items() if until > now
+        }
+        if plate in self.first_read_checks:
+            return None
+        self.first_read_checks[plate] = now + self.settings.plate_cooldown_seconds
+        worker = threading.Thread(
+            target=self._sync_first_read, args=(plate,), name="backend-first-read", daemon=True
+        )
+        worker.start()
+        return worker
+
+    def _sync_first_read(self, plate: str) -> None:
+        try:
+            result = self.backend.sync_plate_detection(plate)
+        except BackendError as error:
+            log.warning("No se pudo consultar la placa %s en el backend: %s", plate, error)
+            return
+        if result.outcome == "NOT_REGISTERED":
+            return
+        log.info("Placa %s reconocida por el backend en la primera lectura (%s)", plate, result.outcome)
+        self._publish_confirmed(plate, 1, last_read=plate, backend_result=result)
+
+    def _publish_confirmed(
+        self,
+        plate: str,
+        read_count: int,
+        last_read: str,
+        backend_result: PlateEntryResult | None = None,
+    ) -> None:
         registered = plate in self.registered_vehicles
         # Con los espacios apagados la ocupación está desactualizada: no se reserva celda local.
         assigned_space = (
@@ -395,25 +438,55 @@ class VideoService:
             replace=True,
         )
         self.plates.start_cooldown(plate)
-        if self.backend:
+        if backend_result is not None:
+            # El backend ya respondió (primera lectura): no hace falta volver a enviarla.
+            self._apply_backend_result(backend_result)
+            self._recheck_soon_if_pending(plate, backend_result)
+        elif self.backend:
             threading.Thread(
-                target=self._sync_with_backend, args=(plate,), name="backend-sync", daemon=True
+                target=self._sync_with_backend,
+                args=(plate, last_read),
+                name="backend-sync",
+                daemon=True,
             ).start()
 
-    def _sync_with_backend(self, plate: str) -> None:
-        """Le pide al backend que asigne y guarde el puesto para esta placa.
+    def _sync_with_backend(self, plate: str, other_read: str | None = None) -> None:
+        """Le avisa al backend de la placa confirmada.
 
         Corre en su propio hilo: una falla de red o un rechazo del backend
         nunca debe detener la detección de video ni el reconocimiento de placas.
         """
         try:
             result = self.backend.sync_plate_detection(plate)
+            if result.outcome == "NOT_REGISTERED" and other_read and other_read != plate:
+                # Dos lecturas casi iguales (ABC128 y ABC123) se confirmaron entre sí:
+                # si el backend no conoce la elegida pero sí la otra, la otra es la real.
+                other = self.backend.sync_plate_detection(other_read)
+                if other.outcome != "NOT_REGISTERED":
+                    self.state.update_plate({"valor": other_read})
+                    result = other
         except BackendError as error:
             self.state.update_plate({"backend_estado": "error", "backend_error": str(error)})
             return
+        self._apply_backend_result(result)
+        self._recheck_soon_if_pending(result.plate, result)
 
+    def _recheck_soon_if_pending(self, plate: str, result: PlateEntryResult) -> None:
+        """Acorta la espera cuando el backend conoce la placa pero aún no hizo nada con ella.
+
+        "Ya tiene puesto" o "no hay cupo" pueden cambiar en segundos (libera el
+        puesto, se desocupa una celda); esperar PLATE_COOLDOWN_SECONDS completos
+        dejaría al estudiante medio minuto sin su aviso. Cuando ya se le avisó o
+        se le asignó, la espera larga sí aplica.
+        """
+        if result.outcome in ("PROMPTED", "ASSIGNED", "NOT_REGISTERED"):
+            return
+        wait = self.settings.plate_recheck_seconds
+        self.plates.start_cooldown(plate, wait)
+        self.first_read_checks[plate] = time.monotonic() + wait
+    def _apply_backend_result(self, result: PlateEntryResult) -> None:
         if not result.assigned:
-            # Placa no registrada, estudiante con puesto activo o sin cupo: se ignora.
+            # Se le avisó al estudiante, o no aplica (no registrada, ya tiene puesto...).
             self.state.update_plate(
                 {"backend_estado": result.outcome.lower(), "backend_error": None}
             )
@@ -435,6 +508,7 @@ class VideoService:
             self.state.update_plate(
                 {"ultimo_intento": time.time(), "error": None, "estado": "leyendo"}
             )
+            started = time.perf_counter()
             plates = [plate for image in images for plate in self.plates.read_all(image)]
             log.info(
                 "Lectura de placas: %d imagen(es) en %.1f s -> %s",
@@ -456,6 +530,8 @@ class VideoService:
                 if confirmed:
                     self._publish_confirmed(*confirmed, last_read=plate)
                     confirmed_any = True
+                else:
+                    self._check_first_read(plate)
 
             if not confirmed_any:
                 self.state.update_plate(
@@ -610,7 +686,10 @@ class VideoService:
                 model_path=self.settings.model_path,
                 confidence=self.settings.yolo_confidence,
                 image_size=self.settings.yolo_image_size,
-                tile_grid=self.settings.yolo_tile_grid,
+                # Sin recortes: en la cámara de placas el vehículo está cerca y se ve
+                # grande; los recortes son para los lejanos del parqueadero y aquí
+                # solo multiplicarían por cinco el tiempo de cada intento.
+                tile_grid=1,
                 minimum_box_area=self.settings.minimum_box_area,
                 minimum_motorcycle_area=self.settings.minimum_motorcycle_area,
             )

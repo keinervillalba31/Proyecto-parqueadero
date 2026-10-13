@@ -31,8 +31,10 @@ class AssignmentResult:
 class PlateEntryResult:
     """Respuesta de POST /api/assignments/plate-entry.
 
-    outcome: ASSIGNED, NOT_REGISTERED, STUDENT_INACTIVE, ALREADY_ASSIGNED o NO_SPACE.
-    Solo ASSIGNED trae los datos del puesto; los demás casos se ignoran.
+    outcome: PROMPTED (se le avisó al estudiante para que elija tiempo y puesto en la
+    plataforma), ALREADY_PROMPTED, ASSIGNED, NOT_REGISTERED, STUDENT_INACTIVE,
+    ALREADY_ASSIGNED, NO_SPACE o NO_LIVE_DATA. Solo ASSIGNED (estudiante sin usuario en
+    la plataforma) trae los datos del puesto; los demás casos solo se informan.
     """
 
     outcome: str
@@ -290,9 +292,9 @@ class BackendClient:
     def register_plate_entry(self, plate: str, parking_id: int | None = None) -> PlateEntryResult:
         """Le pasa al backend la placa leída en la entrada.
 
-        El backend valida el vehículo, evita asignar dos veces al mismo
-        estudiante, elige un puesto libre al azar y le envía el ticket
-        (notificación) al estudiante, todo en una sola transacción.
+        El backend valida el vehículo y le avisa al estudiante para que él
+        elija parqueadero, tiempo y puesto en la plataforma. Si el estudiante
+        no tiene usuario allá, le asigna un puesto libre al azar.
         """
         response = self._mutating_request(
             "POST",

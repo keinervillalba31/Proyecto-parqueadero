@@ -62,6 +62,9 @@ class Settings:
     plate_interval_frames: int = int(os.getenv("PLATE_INTERVAL_FRAMES", "15"))
     plate_confirmation_reads: int = int(os.getenv("PLATE_CONFIRMATION_READS", "2"))
     plate_cooldown_seconds: float = float(os.getenv("PLATE_COOLDOWN_SECONDS", "30"))
+    # Espera corta cuando el backend respondió "por ahora no aplica" (el estudiante ya
+    # tiene puesto, no hay cupo...): eso puede cambiar en segundos, así que se vuelve a consultar pronto.
+    plate_recheck_seconds: float = float(os.getenv("PLATE_RECHECK_SECONDS", "4"))
     plate_require_vehicle: bool = os.getenv("PLATE_REQUIRE_VEHICLE", "true").lower() == "true"
     # Vacío = acepta cualquier texto. Por defecto, placas colombianas.
     plate_pattern: str = os.getenv("PLATE_PATTERN", DEFAULT_PLATE_PATTERN)

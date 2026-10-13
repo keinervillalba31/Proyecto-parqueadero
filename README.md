@@ -207,8 +207,8 @@ Las pruebas simulan YOLO, así que no necesitan GPU ni video.
 
 ## Sincronización con el backend
 
-Además de la reserva local (en memoria, para la vista en vivo), el servicio puede
-pedirle a `educore-backend` que haga y guarde la asignación real:
+Además de la reserva local (en memoria, para la vista en vivo), el servicio le
+avisa a `educore-backend` de cada placa confirmada:
 
 1. Se autentica como una cuenta de servicio (un usuario con rol **Operador**, que
    ya tiene los permisos `ASSIGNMENTS_MANAGE` y `PLATES_VIEW`).
