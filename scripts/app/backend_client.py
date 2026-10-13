@@ -10,6 +10,9 @@ import requests
 from .config import Settings
 
 
+RELOGIN_ON_403_SECONDS = 60
+
+
 class BackendError(RuntimeError):
     """Cualquier falla al hablar con educore-backend (red, login, datos)."""
 
@@ -63,6 +66,7 @@ class BackendClient:
         # cruzan, el POST sale con un token viejo y el backend responde 403.
         self._lock = threading.RLock()
         self._logged_in = False
+        self._logged_in_at = float("-inf")
         self._students_cache: list[dict[str, Any]] = []
         self._students_cache_at: float = 0.0
 
@@ -106,6 +110,7 @@ class BackendClient:
                 f"Login contra el backend falló ({response.status_code}): {response.text[:200]}"
             )
         self._logged_in = True
+        self._logged_in_at = time.monotonic()
 
     def _ensure_login(self) -> None:
         if not self._logged_in:
@@ -124,7 +129,7 @@ class BackendClient:
         except requests.RequestException as error:
             raise BackendError(f"Error de red llamando a {path}: {error}") from error
 
-        if response.status_code == 401 and retry:
+        if retry and self._session_expired(response.status_code):
             # La sesión expiró: se reintenta una sola vez con un login nuevo.
             self._logged_in = False
             self.login()
@@ -134,6 +139,17 @@ class BackendClient:
                 kwargs["headers"] = {**headers, "X-XSRF-TOKEN": self._csrf_token() or ""}
             return self._request(method, path, retry=False, **kwargs)
         return response
+
+    def _session_expired(self, status_code: int) -> bool:
+        """El backend responde 403 (no 401) cuando el JWT vence, al cabo de una hora.
+
+        Un 403 también puede ser falta de permisos, así que solo se toma como
+        sesión vencida si el último login no es reciente: de lo contrario se
+        haría un login nuevo en cada petición rechazada.
+        """
+        if status_code == 401:
+            return True
+        return status_code == 403 and time.monotonic() - self._logged_in_at > RELOGIN_ON_403_SECONDS
 
     def _mutating_request(self, method: str, path: str, *, json: dict[str, Any]) -> requests.Response:
         # El backend invalida la cookie XSRF-TOKEN en cuanto se hace una

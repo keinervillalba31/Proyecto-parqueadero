@@ -258,6 +258,30 @@ def test_request_relogs_in_once_on_401(client):
     assert session.login_attempts == 1
 
 
+def test_request_relogs_in_on_403_when_the_session_is_old(client):
+    """El backend responde 403, no 401, cuando el JWT vence (una hora después del login)."""
+    backend, session = client
+    responses = iter(
+        [FakeResponse(403, {}, text="Forbidden"), FakeResponse(200, {"data": {"version": "1", "cells": []}})]
+    )
+    session._resolve = lambda url: next(responses)  # type: ignore[assignment]
+    backend._logged_in = True  # sesión de hace más de una hora
+
+    assert backend.get_camera_cells(4) == {"version": "1", "cells": []}
+    assert session.login_attempts == 1
+
+
+def test_403_right_after_login_is_a_real_rejection(client):
+    backend, session = client
+    session.script["/api/monitoring/cameras/4/cells"] = FakeResponse(403, {}, text="Forbidden")
+
+    for _ in range(3):
+        with pytest.raises(BackendError):
+            backend.get_camera_cells(4)
+
+    assert session.login_attempts == 1, "sin permisos no se repite el login en cada petición"
+
+
 def test_concurrent_threads_never_send_a_stale_csrf_token(client):
     """El backend cambia la cookie CSRF en cada petición; dos hilos cruzados daban 403."""
     import threading
