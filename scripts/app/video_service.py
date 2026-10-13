@@ -13,6 +13,7 @@ import numpy as np
 from .backend_client import BackendClient, BackendError, PlateEntryResult
 from .config import Settings
 from .parking_detector import ParkingDetector, VehicleDetector
+from .parking_layout import build_layout
 from .plate_reader import PlateReader, vehicle_crops
 from .state import RuntimeState
 
@@ -81,6 +82,9 @@ class VideoService:
         self.plate_vehicle_detector: VehicleDetector | None = None
         self.cells_thread: threading.Thread | None = None
         self.cells_version: str | None = None
+        # Celdas de la plataforma (relativas) y para cuáles ya se envió el plano de planta.
+        self.platform_cells: dict[str, dict[str, Any]] = {}
+        self.layout_reported_for: tuple[str | None, int, int] | None = None
         self.occupancy_thread: threading.Thread | None = None
         self.services_thread: threading.Thread | None = None
         # Última ocupación que aceptó el backend (puesto_id -> ocupado) y cuándo.
@@ -571,14 +575,45 @@ class VideoService:
             return False
 
         self.parking.set_relative_cells(cells)
+        self.platform_cells = cells
         self.state.update_source({"celdas_origen": "plataforma", "celdas_version": version})
         log.info("Celdas actualizadas desde la plataforma: %d (versión %s)", len(cells), version)
+        return True
+
+    def _report_layout(self) -> bool:
+        """Calcula el plano de planta de las celdas y lo envía al backend. True si se envió.
+
+        Es lo que usa la plataforma para mostrarle al estudiante su puesto en el
+        mapa 3D. Solo se recalcula cuando cambian las celdas o el tamaño del video.
+        """
+        with self.frame_lock:
+            frame = self.latest_frame
+        if frame is None or not self.platform_cells:
+            return False
+        height, width = frame.shape[:2]
+        key = (self.cells_version, width, height)
+        if key == self.layout_reported_for:
+            return False
+        try:
+            layout = build_layout(self.platform_cells, width, height)
+        except ValueError as error:
+            log.warning("No se pudo calcular el plano del parqueadero: %s", error)
+            self.layout_reported_for = key        # no se reintenta hasta que cambien las celdas
+            return False
+        try:
+            self.backend.report_layout(self.settings.backend_camera_id, self.cells_version or "", layout)
+        except BackendError as error:
+            log.warning("No se pudo enviar el plano del parqueadero al backend: %s", error)
+            return False
+        self.layout_reported_for = key
+        log.info("Plano del parqueadero enviado al backend: %d puestos", len(layout))
         return True
 
     def _cells_loop(self) -> None:
         """Revisa cada cierto tiempo si el administrador cambió las celdas."""
         while self.running:
             self._refresh_cells()
+            self._report_layout()
             waited = 0.0
             while self.running and waited < self.settings.backend_cells_poll_seconds:
                 time.sleep(0.5)

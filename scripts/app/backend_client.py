@@ -212,6 +212,19 @@ class BackendClient:
             )
         return response.json().get("data", {})
 
+    def report_layout(self, camera_id: int, version: str, cells: list[dict[str, Any]]) -> None:
+        """Envía el plano de planta de los puestos de esta cámara (para el mapa 3D del estudiante)."""
+        response = self._mutating_request(
+            "PUT",
+            f"/api/monitoring/cameras/{camera_id}/layout",
+            json={"version": version, "cells": cells},
+        )
+        if response.status_code != 200:
+            raise BackendError(
+                f"El backend rechazó el plano de la cámara {camera_id} "
+                f"({response.status_code}): {response.text[:200]}"
+            )
+
     @staticmethod
     def _services_from(response: requests.Response) -> dict[str, bool]:
         data = response.json().get("data") or {}

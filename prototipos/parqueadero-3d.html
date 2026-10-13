@@ -1,0 +1,951 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prototipo 3D del parqueadero</title>
+<style>
+  :root { --primario: #b5122b; --texto: #32151b; --tenue: #7a5c63; --borde: #f0d9de; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: #cfe3f2; color: var(--texto); font: 15px/1.4 "Segoe UI", system-ui, sans-serif; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+  .tarjeta { background: rgb(255 255 255 / 94%); border: 1px solid var(--borde); border-radius: 14px; box-shadow: 0 10px 30px rgb(50 21 27 / 18%); left: 16px; padding: 14px 16px; position: fixed; top: 16px; width: min(290px, calc(100vw - 32px)); }
+  .etiqueta { color: var(--tenue); font-size: .68rem; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
+  .puesto { color: var(--primario); font-size: 2.6rem; font-weight: 900; line-height: 1.05; }
+  .zona { color: var(--tenue); font-size: .85rem; margin-bottom: 10px; }
+  .botones { display: grid; gap: 8px; grid-template-columns: 1fr 1fr; }
+  button { background: #fff; border: 1px solid #dfb9c1; border-radius: 9px; color: var(--texto); cursor: pointer; font: inherit; font-size: .82rem; font-weight: 700; padding: .55rem .4rem; }
+  button.principal { background: var(--primario); border-color: var(--primario); color: #fff; }
+  button:focus-visible, select:focus-visible { outline: 2px solid var(--primario); outline-offset: 2px; }
+  .fila { align-items: center; border-top: 1px solid var(--borde); display: flex; font-size: .82rem; gap: 8px; justify-content: space-between; margin-top: 10px; padding-top: 10px; }
+  select { border: 1px solid #dfb9c1; border-radius: 8px; font: inherit; font-size: .82rem; padding: .3rem .4rem; }
+  .leyenda { background: rgb(255 255 255 / 90%); border: 1px solid var(--borde); border-radius: 999px; bottom: 16px; display: flex; font-size: .78rem; gap: 14px; left: 50%; padding: 6px 14px; position: fixed; transform: translateX(-50%); white-space: nowrap; }
+  .leyenda i { border-radius: 3px; display: inline-block; height: 10px; margin-right: 5px; width: 10px; }
+  .ayuda { bottom: 52px; color: #fff; font-size: .74rem; left: 50%; max-width: calc(100vw - 32px); position: fixed; text-align: center; text-shadow: 0 1px 3px rgb(0 0 0 / 60%); transform: translateX(-50%); width: max-content; }
+  .aviso { background: #fff; border-radius: 12px; left: 50%; max-width: 420px; padding: 18px; position: fixed; text-align: center; top: 40%; transform: translate(-50%, -50%); }
+</style>
+</head>
+<body>
+<div class="tarjeta">
+  <div class="etiqueta">Tu puesto asignado</div>
+  <div class="puesto" id="puesto">—</div>
+  <div class="zona" id="zona"></div>
+  <div class="botones">
+    <button class="principal" id="ir">Ver mi puesto</button>
+    <button id="general">Vista general</button>
+  </div>
+  <div class="fila">
+    <label for="otro">Probar con otro puesto</label>
+    <select id="otro"></select>
+  </div>
+  <div class="fila">
+    <label for="foto">Ver la foto real de la cámara</label>
+    <input type="checkbox" id="foto">
+  </div>
+</div>
+<div class="ayuda">Arrastra para girar · rueda o pellizco para acercar · clic derecho para mover</div>
+<div class="leyenda">
+  <span><i style="background:#13c27a"></i>Tu puesto</span>
+  <span><i style="background:#9aa3ad"></i>Ocupado</span>
+  <span><i style="background:#fff;border:1px solid #9aa3ad"></i>Libre</span>
+  <span><i style="background:#ffd23f"></i>Recorrido</span>
+</div>
+
+<script src="datos_3d.js"></script>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
+
+const DATA = window.PARQUEADERO;
+if (!DATA) {
+  document.body.insertAdjacentHTML('beforeend', '<div class="aviso">Faltan los datos. Ejecuta <code>python prototipos/generar_parqueadero_3d.py prototipos/celdas_camara_4.json</code>.</div>');
+  throw new Error('sin datos');
+}
+
+// Números "al azar" pero siempre iguales, para que la escena no cambie en cada carga.
+let seed = 7;
+const random = () => { seed = (seed * 16807) % 2147483647; return (seed - 1) / 2147483646; };
+const between = (a, b) => a + (b - a) * random();
+
+// El suelo de los datos es (x, y) en metros; en la escena, y pasa a ser z y la altura es y.
+const cells = DATA.cells.map((cell) => ({
+  ...cell,
+  cx: (cell.x0 + cell.x1) / 2, cz: (cell.y0 + cell.y1) / 2,
+  w: Math.abs(cell.x1 - cell.x0), d: Math.abs(cell.y1 - cell.y0),
+}));
+const lot = {
+  x0: Math.min(...cells.map((c) => c.x0)), x1: Math.max(...cells.map((c) => c.x1)),
+  z0: Math.min(...cells.map((c) => c.y0)), z1: Math.max(...cells.map((c) => c.y1)),
+};
+const columns = cells.filter((c) => c.w > c.d * 1.3 && c.type === 'CAR');
+
+// Pasillos: los huecos anchos entre columnas de puestos.
+const spans = [...columns].sort((a, b) => a.x0 - b.x0).reduce((list, c) => {
+  const last = list[list.length - 1];
+  if (last && c.x0 < last[1] + 1) { last[1] = Math.max(last[1], c.x1); } else { list.push([c.x0, c.x1]); }
+  return list;
+}, []);
+const aisles = spans.slice(1).map((span, i) => (spans[i][1] + span[0]) / 2).filter((x, i) => spans[i + 1][0] - spans[i][1] > 3);
+const entrance = new THREE.Vector3(aisles.length ? aisles[aisles.length - 1] : 0, 0, lot.z1 + 5.5);
+
+// --- escena ---------------------------------------------------------------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+document.body.prepend(renderer.domElement);
+
+const scene = new THREE.Scene();
+const HORIZON = '#d9e8f1';
+scene.fog = new THREE.Fog(HORIZON, 120, 420);
+const camera = new THREE.PerspectiveCamera(42, 1, 0.5, 900);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.maxPolarAngle = Math.PI / 2.12;
+controls.minDistance = 5;
+controls.maxDistance = 95;
+
+const hemisphere = new THREE.HemisphereLight('#dbeaff', '#6f7f5a', 0.55);
+scene.add(hemisphere);
+const sun = new THREE.DirectionalLight('#fff1d6', 3.0);
+sun.position.set(-26, 42, 22);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.bias = -0.0004;
+sun.shadow.normalBias = 0.03;
+Object.assign(sun.shadow.camera, { left: -42, right: 42, top: 42, bottom: -42, near: 1, far: 140 });
+scene.add(sun);
+
+const group = (...children) => { const g = new THREE.Group(); g.add(...children); return g; };
+function mesh(geometry, material, x = 0, y = 0, z = 0, { cast = true, receive = false } = {}) {
+  const m = new THREE.Mesh(geometry, material);
+  m.position.set(x, y, z);
+  m.castShadow = cast;
+  m.receiveShadow = receive;
+  return m;
+}
+function flat(geometry, material, x, y, z, parent = scene) {
+  const m = new THREE.Mesh(geometry, material);
+  m.rotation.x = -Math.PI / 2;
+  m.position.set(x, y, z);
+  parent.add(m);
+  return m;
+}
+
+// Texturas dibujadas en un lienzo: no dependen de archivos externos.
+function canvasTexture(size, draw, repeatX = 1, repeatY = 1) {
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = size;
+  draw(canvas.getContext('2d'), size);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
+  texture.repeat.set(repeatX, repeatY);
+  texture.anisotropy = 8;
+  return texture;
+}
+const shade = (hue, saturation, light) => `hsl(${hue} ${saturation}% ${light}%)`;          // para el lienzo
+const tint = (hue, saturation, light) => new THREE.Color().setHSL(hue / 360, saturation / 100, light / 100);  // para materiales
+
+// Adoquín gris en espiga corrida, como el piso real.
+const paverTexture = (repeatX, repeatY) => canvasTexture(512, (g, size) => {
+  g.fillStyle = '#6f6b64';
+  g.fillRect(0, 0, size, size);
+  const bw = 64, bh = 32;
+  for (let row = 0; row < size / bh; row += 1) {
+    for (let col = -1; col < size / bw + 1; col += 1) {
+      g.fillStyle = shade(between(28, 42), between(4, 10), between(42, 56));
+      g.fillRect(col * bw + (row % 2 ? bw / 2 : 0) + 1.5, row * bh + 1.5, bw - 3, bh - 3);
+    }
+  }
+  for (let i = 0; i < 900; i += 1) {
+    g.fillStyle = `rgb(0 0 0 / ${between(0.03, 0.1)})`;
+    g.fillRect(between(0, size), between(0, size), between(1, 3), between(1, 3));
+  }
+}, repeatX, repeatY);
+
+const grassTexture = canvasTexture(256, (g, size) => {
+  g.fillStyle = '#7d9c5c';
+  g.fillRect(0, 0, size, size);
+  for (let i = 0; i < 5000; i += 1) {
+    g.fillStyle = shade(between(80, 105), between(28, 45), between(34, 52));
+    g.fillRect(between(0, size), between(0, size), between(1, 4), between(1, 4));
+  }
+}, 90, 90);
+
+const tileTexture = (repeatX, repeatY) => canvasTexture(256, (g, size) => {
+  g.fillStyle = '#a8553a';
+  g.fillRect(0, 0, size, size);
+  const tw = 32, th = 32;
+  for (let row = 0; row < size / th; row += 1) {
+    for (let col = 0; col < size / tw; col += 1) {
+      const light = between(38, 52);
+      const gradient = g.createLinearGradient(col * tw, 0, (col + 1) * tw, 0);
+      gradient.addColorStop(0, shade(between(12, 20), 52, light - 12));
+      gradient.addColorStop(0.5, shade(between(12, 20), 55, light + 4));
+      gradient.addColorStop(1, shade(between(12, 20), 52, light - 12));
+      g.fillStyle = gradient;
+      g.fillRect(col * tw, row * th, tw, th - 2);
+    }
+    g.fillStyle = 'rgb(40 15 8 / 45%)';
+    g.fillRect(0, row * th + th - 3, size, 3);
+  }
+}, repeatX, repeatY);
+
+const brickTexture = (repeatX, repeatY) => canvasTexture(256, (g, size) => {
+  g.fillStyle = '#c9b9a5';
+  g.fillRect(0, 0, size, size);
+  for (let row = 0; row < 16; row += 1) for (let col = -1; col < 9; col += 1) {
+    g.fillStyle = shade(between(10, 18), between(45, 58), between(36, 46));
+    g.fillRect(col * 32 + (row % 2 ? 16 : 0) + 1, row * 16 + 1, 30, 14);
+  }
+}, repeatX, repeatY);
+
+// El mismo dibujo sirve de relieve: las juntas oscuras quedan hundidas.
+function relief(material, scale) {
+  material.bumpMap = material.map;
+  material.bumpScale = scale;
+  return material;
+}
+
+// --- cielo, terreno y cerros -------------------------------------------------
+scene.add(new THREE.Mesh(
+  new THREE.SphereGeometry(600, 32, 16),
+  new THREE.ShaderMaterial({
+    side: THREE.BackSide, depthWrite: false, fog: false,
+    uniforms: { top: { value: new THREE.Color('#5d9bd6') }, bottom: { value: new THREE.Color(HORIZON) } },
+    vertexShader: 'varying float h; void main(){ h = normalize(position).y; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+    fragmentShader: 'uniform vec3 top; uniform vec3 bottom; varying float h; void main(){ gl_FragColor = vec4(mix(bottom, top, pow(clamp(h, 0.0, 1.0), 0.55)), 1.0); }',
+  })));
+
+// El mismo cielo sirve de entorno: es lo que se refleja en la pintura y los vidrios.
+{
+  const skyOnly = new THREE.Scene();
+  skyOnly.add(scene.children[scene.children.length - 1].clone());
+  const ground = new THREE.Mesh(new THREE.CircleGeometry(500, 24), new THREE.MeshBasicMaterial({ color: '#6f7d5c' }));
+  ground.rotation.x = -Math.PI / 2;
+  ground.position.y = -2;
+  skyOnly.add(ground);
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  scene.environment = pmrem.fromScene(skyOnly, 0.03).texture;
+  pmrem.dispose();
+}
+
+// Material real con licencia CC0 (Poly Haven), cargado desde su CDN. Si no hay internet, la
+// escena se queda con el cielo y las texturas dibujadas por código.
+const POLYHAVEN = 'https://dl.polyhaven.org/file/ph-assets';
+const proceduralSky = scene.children.find((child) => child.material?.type === 'ShaderMaterial');
+new RGBELoader().load(`${POLYHAVEN}/HDRIs/hdr/2k/kloofendal_48d_partly_cloudy_puresky_2k.hdr`, (sky) => {
+  sky.mapping = THREE.EquirectangularReflectionMapping;
+  scene.background = sky;
+  scene.environment = sky;
+  proceduralSky.visible = false;
+  scene.fog.color.set('#c9d9e6');
+  hemisphere.intensity = 0.1;
+  // El sol de la escena se pone donde está el sol de la foto, para que las sombras coincidan con la luz.
+  const { data, width, height } = sky.image;
+  let brightest = 0, u = 0.3, v = 0.75;
+  for (let row = 0; row < height / 2; row += 2) {
+    for (let column = 0; column < width; column += 2) {
+      const i = (row * width + column) * 4;       // los píxeles vienen en media precisión (16 bits)
+      const light = THREE.DataUtils.fromHalfFloat(data[i]) + THREE.DataUtils.fromHalfFloat(data[i + 1]) + THREE.DataUtils.fromHalfFloat(data[i + 2]);
+      if (light > brightest) { brightest = light; u = column / width; v = 1 - row / height; }
+    }
+  }
+  const elevation = (v - 0.5) * Math.PI, azimuth = (u - 0.5) * Math.PI * 2;
+  sun.position.set(Math.cos(elevation) * Math.cos(azimuth), Math.sin(elevation), Math.cos(elevation) * Math.sin(azimuth)).multiplyScalar(70).add(lotCenter);
+  sun.target.position.copy(lotCenter);
+  scene.add(sun.target);
+  // En la foto el disco del sol es miles de veces más brillante que el cielo. Si se deja, toda la luz
+  // directa vendría del entorno, que no proyecta sombras. Se recorta ese pico: el cielo queda como luz
+  // de relleno y la luz directa (con sombras) la pone el sol de la escena.
+  const ceiling = THREE.DataUtils.toHalfFloat(6);
+  for (let i = 0; i < data.length; i += 1) {
+    if (data[i] > ceiling && data[i] < 0x7c00) { data[i] = ceiling; }   // en media precisión, los positivos ordenan igual que sus bits
+  }
+  sky.needsUpdate = true;
+  sun.intensity = 4.2;
+  renderer.toneMappingExposure = 0.92;
+});
+
+const textureLoader = new THREE.TextureLoader().setCrossOrigin('anonymous');
+/** Cambia el dibujo de un material por una textura escaneada: color, relieve fino y brillo. */
+function scanned(material, name, repeatX, repeatY, { rotation = 0, tint = null } = {}) {
+  const load = (suffix, apply) => textureLoader.load(`${POLYHAVEN}/Textures/jpg/1k/${name}/${name}_${suffix}_1k.jpg`, (texture) => {
+    texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
+    texture.repeat.set(repeatX, repeatY);
+    texture.rotation = rotation;
+    texture.anisotropy = 8;
+    apply(texture);
+    material.needsUpdate = true;
+  });
+  load('diff', (texture) => {
+    texture.colorSpace = THREE.SRGBColorSpace;
+    material.map = texture;
+    material.bumpMap = null;
+    if (tint) { material.color.setRGB(...tint); }   // por encima de 1 aclara la textura
+  });
+  load('nor_gl', (texture) => { material.normalMap = texture; });
+  load('rough', (texture) => { material.roughnessMap = texture; material.roughness = 1; });
+  return material;
+}
+
+const B = DATA.bounds;
+const midX = (B.xMin + B.xMax) / 2, midZ = (B.yMin + B.yMax) / 2;
+const lotCx = (lot.x0 + lot.x1) / 2, lotCz = (lot.z0 + lot.z1) / 2;
+
+const terrain = flat(new THREE.PlaneGeometry(900, 900), scanned(relief(new THREE.MeshStandardMaterial({ map: grassTexture, roughness: 1, envMapIntensity: 0.25 }), 2), 'leafy_grass', 170, 170, { tint: [0.8, 1.4, 0.62] }), midX, -0.06, midZ);
+terrain.receiveShadow = true;
+
+// Cerros verdes al fondo, como los que rodean la sede.
+for (let i = 0; i < 16; i += 1) {
+  const angle = Math.PI * (0.92 + i * 0.085) + between(-0.03, 0.03);
+  const distance = between(230, 330);
+  const hill = new THREE.Mesh(new THREE.SphereGeometry(1, 20, 12),
+    new THREE.MeshStandardMaterial({ color: tint(between(95, 120), between(22, 32), between(26, 36)), roughness: 1, envMapIntensity: 0.15 }));
+  hill.scale.set(between(70, 130), between(26, 58), between(60, 110));
+  hill.position.set(lotCx + Math.cos(angle) * distance, -6, lotCz + Math.sin(angle) * distance);
+  scene.add(hill);
+}
+
+// --- piso del parqueadero ----------------------------------------------------
+const padW = lot.x1 - lot.x0 + 5.5, padD = lot.z1 - lot.z0 + 12;
+const padX = lotCx - 0.25, padZ = lotCz + 3;
+const schematic = new THREE.Group();   // todo lo que se oculta al mostrar la foto real
+scene.add(schematic);
+flat(new THREE.PlaneGeometry(padW, padD), scanned(relief(new THREE.MeshStandardMaterial({ map: paverTexture(padW / 4, padD / 4), roughness: 0.92, envMapIntensity: 0.4 }), 2.2), 'brick_pavement_02', padW / 2.4, padD / 2.4, { tint: [1.95, 2.05, 2.1] }), padX, 0.01, padZ, schematic).receiveShadow = true;
+
+// Vía de acceso hacia la entrada.
+flat(new THREE.PlaneGeometry(9, 60), scanned(relief(new THREE.MeshStandardMaterial({ map: paverTexture(2.25, 15), roughness: 0.92, envMapIntensity: 0.4 }), 2.2), 'brick_pavement_02', 9 / 2.4, 60 / 2.4, { tint: [1.95, 2.05, 2.1] }), entrance.x, 0.008, padZ + padD / 2 + 30, schematic).receiveShadow = true;
+
+// Bordillos de concreto, con el tramo amarillo de la esquina como en el sitio.
+const concrete = new THREE.MeshStandardMaterial({ color: '#b9b6ad', roughness: 0.9 });
+const yellowCurb = new THREE.MeshStandardMaterial({ color: '#e0b422', roughness: 0.8 });
+function curb(x, z, width, depth, material = concrete) {
+  schematic.add(mesh(new THREE.BoxGeometry(width, 0.18, depth), material, x, 0.09, z, { receive: true }));
+}
+curb(padX - padW / 2, padZ - 6, 0.3, padD - 12);
+curb(padX - padW / 2, padZ + padD / 2 - 6, 0.3, 12, yellowCurb);
+curb(padX, padZ - padD / 2, padW, 0.3);
+curb(padX + padW / 2, padZ, 0.3, padD);
+
+// Piso con la foto de la cámara enderezada a vista de planta.
+const texture = new THREE.TextureLoader().load(DATA.texture);
+texture.colorSpace = THREE.SRGBColorSpace;
+texture.anisotropy = 8;
+const photo = flat(new THREE.PlaneGeometry(B.xMax - B.xMin, B.yMax - B.yMin), new THREE.MeshBasicMaterial({ map: texture, toneMapped: false }), midX, 0.012, midZ);
+const photoShadow = flat(new THREE.PlaneGeometry(200, 200), new THREE.ShadowMaterial({ opacity: 0.3 }), midX, 0.02, midZ);
+photoShadow.receiveShadow = true;
+
+// --- puestos ----------------------------------------------------------------
+const paint = new THREE.MeshStandardMaterial({ color: '#ecebe6', roughness: 0.8, transparent: true, opacity: 0.92 });
+function outline(c) {
+  const t = 0.11, y = 0.025;
+  flat(new THREE.PlaneGeometry(c.w, t), paint, c.cx, y, c.y0);
+  flat(new THREE.PlaneGeometry(c.w, t), paint, c.cx, y, c.y1);
+  flat(new THREE.PlaneGeometry(t, c.d), paint, c.x0, y, c.cz);
+  flat(new THREE.PlaneGeometry(t, c.d), paint, c.x1, y, c.cz);
+}
+
+function textTexture(text, { size = 64, color = '#ffffff', background = null, padding = 18 } = {}) {
+  const canvas = document.createElement('canvas');
+  const context = canvas.getContext('2d');
+  context.font = `800 ${size}px "Segoe UI", sans-serif`;
+  canvas.width = Math.ceil(context.measureText(text).width) + padding * 2;
+  canvas.height = size + padding * 2;
+  if (background) {
+    context.fillStyle = background;
+    context.beginPath();
+    context.roundRect(0, 0, canvas.width, canvas.height, 22);
+    context.fill();
+  }
+  context.font = `800 ${size}px "Segoe UI", sans-serif`;
+  context.fillStyle = color;
+  context.textAlign = 'center';
+  context.textBaseline = 'middle';
+  context.fillText(text, canvas.width / 2, canvas.height / 2 + 2);
+  const result = new THREE.CanvasTexture(canvas);
+  result.colorSpace = THREE.SRGBColorSpace;
+  return { texture: result, ratio: canvas.width / canvas.height };
+}
+
+// El número va pintado en la boca del puesto (el lado del pasillo), para que se lea aunque haya un carro.
+function groundLabel(c) {
+  const { texture: map, ratio } = textTexture(c.number, { size: 56, padding: 8 });
+  const height = Math.min(0.62, Math.min(c.w, c.d) * 0.3);
+  const label = flat(new THREE.PlaneGeometry(height * ratio, height),
+    new THREE.MeshBasicMaterial({ map, transparent: true, opacity: 0.92, depthWrite: false }), c.cx, 0.035, c.cz);
+  if (c.w > c.d * 1.3) {
+    const lane = nearestAisle(c);
+    const side = Math.sign(lane - c.cx) || 1;
+    label.position.x = c.cx + side * (c.w / 2 + 0.25 + height * 0.5);
+    label.rotation.z = -side * Math.PI / 2;
+  } else {
+    label.position.z = c.y1 + 0.3 + height * 0.5;
+  }
+}
+function nearestAisle(c) {
+  return aisles.length ? aisles.reduce((best, x) => (Math.abs(x - c.cx) < Math.abs(best - c.cx) ? x : best)) : c.cx;
+}
+
+// --- vehículos ----------------------------------------------------------------
+// Cada carro es una sola superficie curva: se recorre de la cola a la trompa y en cada corte
+// se dibuja la sección (piso, costado, cintura, vidrio, techo). Así el capó, el techo y las
+// esquinas salen redondeados y los vidrios quedan al ras, como en un carro actual.
+// x: largo (trompa en +x). Las alturas están en metros desde el piso.
+const CAR_MODELS = {
+  hatchback: { length: 3.98, width: 1.74, clearance: 0.19, nose: 0.66, cowl: 0.99, belt: 1.0, deck: 1.0, tail: 0.86, roof: 1.5, wsBase: 0.86, roofFront: 0.16, roofRear: -1.3, rearBase: -1.86, axle: 1.26, wheel: 0.31 },
+  suv: { length: 4.32, width: 1.82, clearance: 0.26, nose: 0.82, cowl: 1.13, belt: 1.14, deck: 1.14, tail: 1.02, roof: 1.66, wsBase: 0.94, roofFront: 0.3, roofRear: -1.52, rearBase: -2.02, axle: 1.36, wheel: 0.37 },
+  sedan: { length: 4.52, width: 1.78, clearance: 0.17, nose: 0.64, cowl: 0.96, belt: 0.97, deck: 0.98, tail: 0.84, roof: 1.44, wsBase: 0.98, roofFront: 0.28, roofRear: -0.82, rearBase: -1.5, axle: 1.38, wheel: 0.32 },
+};
+// Los colores que más se ven en un parqueadero real: blancos, platas y grises, y algunos de color.
+const CAR_PAINTS = ['#f4f5f6', '#c9cdd2', '#f0f1f2', '#8e949b', '#3a3e45', '#b3141f', '#d9dcdf', '#1e2c4f', '#6f757c', '#8f1220', '#e8e9ea', '#2a2c30'];
+const smooth = (t) => { const c = Math.min(1, Math.max(0, t)); return c * c * (3 - 2 * c); };
+const mix = (a, b, t) => a + (b - a) * t;
+
+function carSection(m, x) {
+  const half = m.length / 2, t = Math.abs(x) / half;
+  const width = (m.width / 2) * (1 - 0.05 * t * t) * Math.pow(Math.max(0, 1 - Math.pow(t, 8)), 0.3);   // planta redondeada
+  const floor = m.clearance + 0.16 * Math.pow(t, 6);
+  let belt;
+  if (x >= m.wsBase) {
+    const f = (x - m.wsBase) / (half - m.wsBase);
+    belt = m.cowl - (m.cowl - m.nose) * (0.3 * f + 0.7 * Math.pow(f, 4));                               // capó que cae hacia la trompa
+  } else if (x <= m.rearBase) {
+    belt = m.deck - (m.deck - m.tail) * Math.pow((m.rearBase - x) / (m.rearBase + half), 3);
+  } else {
+    belt = mix(m.deck, m.cowl, smooth((x - m.rearBase) / (m.wsBase - m.rearBase)));
+  }
+  // cabina: 0 sobre el capó y el baúl, 1 bajo el techo; las rampas son el parabrisas y el vidrio trasero.
+  const cabin = smooth((m.wsBase - x) / (m.wsBase - m.roofFront)) * smooth((x - m.rearBase) / (m.roofRear - m.rearBase));
+  return { width, floor, belt, cabin, top: belt + 0.03 + cabin * (m.roof - m.belt) };
+}
+
+const RING = 22;   // puntos por sección: 12 de un costado (del piso al techo) y su espejo
+function carBody(m) {
+  const stations = 34, positions = [], sections = [];
+  for (let i = 0; i < stations; i += 1) {
+    const x = (m.length / 2) * Math.sin(((i / (stations - 1)) * 2 - 1) * Math.PI / 2);   // más cortes cerca de las puntas
+    const k = carSection(m, x);
+    sections.push({ ...k, x });
+    const w = k.width, roofWidth = w * mix(0.93, 0.76, k.cabin), shoulder = w * mix(0.965, 0.95, k.cabin);
+    const side = [
+      [0, k.floor], [0.62 * w, k.floor], [0.9 * w, k.floor + 0.03], [0.99 * w, k.floor + 0.13],
+      [w, mix(k.floor, k.belt, 0.55)], [0.99 * w, k.belt - 0.07], [shoulder, k.belt],
+      [mix(shoulder, roofWidth, 0.6), mix(k.belt, k.top, 0.62)], [roofWidth, k.top - mix(0.02, 0.07, k.cabin)],
+      [roofWidth * 0.82, k.top - 0.012], [roofWidth * 0.45, k.top], [0, k.top + 0.014],
+    ];
+    const ring = [...side, ...side.slice(1, 11).reverse().map(([z, y]) => [-z, y])];
+    ring.forEach(([z, y]) => positions.push(x, y, z));
+  }
+  // Cada cuadro de la malla se asigna a pintura, vidrio o plástico según en qué parte de la sección cae.
+  const faces = { paint: [], glass: [], trim: [] };
+  for (let i = 0; i < stations - 1; i += 1) {
+    const cabin = (sections[i].cabin + sections[i + 1].cabin) / 2;
+    const xMid = (sections[i].x + sections[i + 1].x) / 2;
+    const pillarX = (m.roofFront + m.roofRear) / 2 - 0.08;
+    const bPillar = sections[i].x <= pillarX && pillarX < sections[i + 1].x;
+    for (let r = 0; r < RING; r += 1) {
+      const band = r <= 10 ? r : 21 - r;
+      let part = 'paint';
+      if (band <= 2) { part = 'trim'; }
+      else if (band <= 4 && Math.abs(xMid) > m.length / 2 - 0.2) { part = 'trim'; }             // parrilla y bajos del bómper
+      else if (band === 6 || band === 7) { part = bPillar ? 'trim' : cabin > 0.6 ? 'glass' : 'paint'; }   // ventanas entre parales
+      else if (band >= 8) { part = cabin > 0.1 && cabin < 0.9 ? 'glass' : 'paint'; }             // parabrisas y vidrio trasero
+      const a = i * RING + r, b = (i + 1) * RING + r, c = (i + 1) * RING + (r + 1) % RING, d = i * RING + (r + 1) % RING;
+      faces[part].push(a, d, c, a, c, b);
+    }
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  const order = ['paint', 'glass', 'trim'];
+  const build = (flip) => {
+    geometry.clearGroups();
+    geometry.setIndex(order.flatMap((part) => (flip ? [...faces[part]].reverse() : faces[part])));
+    let start = 0;
+    order.forEach((part, index) => { geometry.addGroup(start, faces[part].length, index); start += faces[part].length; });
+    geometry.computeVertexNormals();
+  };
+  build(false);
+  // El punto más alto del techo debe mirar hacia arriba; si no, la malla quedó al revés.
+  const roofVertex = Math.floor(stations / 2) * RING + 11;
+  if (geometry.attributes.normal.getY(roofVertex) < 0) { build(true); }
+  return geometry;
+}
+const carGeometries = Object.fromEntries(Object.entries(CAR_MODELS).map(([name, model]) => [name, carBody(model)]));
+
+const glassMaterial = new THREE.MeshPhysicalMaterial({ color: '#0b1216', roughness: 0.04, metalness: 0.0, clearcoat: 1, clearcoatRoughness: 0.03, envMapIntensity: 1.7 });
+const tyre = new THREE.MeshStandardMaterial({ color: '#101113', roughness: 0.9 });
+const rim = new THREE.MeshStandardMaterial({ color: '#c9cdd2', roughness: 0.22, metalness: 0.95 });
+const trim = new THREE.MeshStandardMaterial({ color: '#17191c', roughness: 0.75 });
+const headlight = new THREE.MeshPhysicalMaterial({ color: '#f4f6f8', emissive: '#e9f1ff', emissiveIntensity: 0.25, roughness: 0.05, clearcoat: 1 });
+const taillight = new THREE.MeshPhysicalMaterial({ color: '#8d0c14', emissive: '#5c0000', emissiveIntensity: 0.6, roughness: 0.1, clearcoat: 1 });
+const plateMaterial = new THREE.MeshStandardMaterial({ color: '#f2c40f', roughness: 0.5 });
+const tyreGeometry = new THREE.LatheGeometry(
+  [[0.55, -0.5], [0.9, -0.5], [1, -0.36], [1, 0.36], [0.9, 0.5], [0.55, 0.5]].map(([r, y]) => new THREE.Vector2(r, y)), 32);
+
+const contactShadow = new THREE.MeshBasicMaterial({
+  transparent: true, depthWrite: false, toneMapped: false,
+  map: (() => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 256; canvas.height = 128;
+    const g = canvas.getContext('2d');
+    g.filter = 'blur(14px)';
+    g.fillStyle = 'rgb(0 0 0 / 78%)';
+    g.beginPath();
+    g.roundRect(34, 26, 188, 76, 30);
+    g.fill();
+    return new THREE.CanvasTexture(canvas);
+  })(),
+});
+
+function wheel(radius) {
+  const tyreMesh = mesh(tyreGeometry, tyre);
+  tyreMesh.scale.set(radius, 0.22, radius);
+  const w = group(tyreMesh, mesh(new THREE.CylinderGeometry(radius * 0.62, radius * 0.62, 0.2, 28), rim));
+  for (let i = 0; i < 5; i += 1) {                      // huecos entre los rayos del rin
+    w.add(mesh(new THREE.CylinderGeometry(radius * 0.13, radius * 0.13, 0.205, 12), trim,
+      Math.cos(i * 1.2566) * radius * 0.38, 0, Math.sin(i * 1.2566) * radius * 0.38, { cast: false }));
+  }
+  w.add(mesh(new THREE.CylinderGeometry(radius * 0.12, radius * 0.12, 0.215, 12), rim, 0, 0, 0, { cast: false }));
+  w.rotation.x = Math.PI / 2;
+  return w;
+}
+const ellipsoid = (material, sx, sy, sz, x, y, z) => {
+  const part = mesh(new THREE.SphereGeometry(1, 16, 12), material, x, y, z, { cast: false });
+  part.scale.set(sx, sy, sz);
+  return part;
+};
+
+function buildCar(c, index) {
+  const name = ['hatchback', 'suv', 'sedan', 'hatchback', 'suv', 'hatchback', 'sedan'][index % 7];
+  const m = CAR_MODELS[name];
+  const paintMaterial = new THREE.MeshPhysicalMaterial({ color: CAR_PAINTS[(index * 5 + 2) % CAR_PAINTS.length], roughness: 0.3, metalness: 0.55, clearcoat: 1, clearcoatRoughness: 0.06, envMapIntensity: 1.15 });
+  const car = new THREE.Group();
+  const half = m.length / 2;
+  car.add(mesh(carGeometries[name], [paintMaterial, glassMaterial, trim]));
+
+  for (const sx of [-1, 1]) {
+    const sectionWidth = carSection(m, sx * m.axle).width;
+    for (const sz of [-1, 1]) {
+      const w = wheel(m.wheel);
+      w.position.set(sx * m.axle, m.wheel, sz * (sectionWidth - 0.085));
+      car.add(w);
+      // Paso de rueda: un arco oscuro sobre el costado, detrás de la llanta.
+      const arch = mesh(new THREE.CylinderGeometry(m.wheel * 1.2, m.wheel * 1.2, 0.03, 28), trim, sx * m.axle, m.wheel + 0.02, sz * (sectionWidth - 0.012), { cast: false });
+      arch.rotation.x = Math.PI / 2;
+      car.add(arch);
+    }
+  }
+  // Faros, stops, parrilla, espejos y placas, apoyados sobre la carrocería.
+  const nose = carSection(m, half - 0.2), tail = carSection(m, -half + 0.16), cowl = carSection(m, m.wsBase - 0.12);
+  for (const sz of [-1, 1]) {
+    car.add(ellipsoid(headlight, 0.16, 0.036, 0.22, half - 0.2, nose.belt - 0.062, sz * nose.width * 0.72));
+    car.add(ellipsoid(taillight, 0.12, 0.08, 0.2, -half + 0.15, tail.belt - 0.1, sz * tail.width * 0.74));
+    car.add(ellipsoid(paintMaterial, 0.085, 0.05, 0.075, m.wsBase - 0.2, cowl.belt + 0.035, sz * cowl.width * 0.985));   // espejo, pegado a la puerta
+  }
+  const tipFloor = m.clearance + 0.16;
+  car.add(ellipsoid(trim, 0.08, 0.085, nose.width * 0.6, half - 0.09, mix(tipFloor, m.nose, 0.36), 0));              // parrilla
+  car.add(mesh(new THREE.BoxGeometry(0.02, 0.11, 0.4), plateMaterial, half + 0.004, mix(tipFloor, m.nose, 0.3), 0, { cast: false }));
+  car.add(mesh(new THREE.BoxGeometry(0.02, 0.11, 0.4), plateMaterial, -half - 0.004, mix(tipFloor, m.tail, 0.5), 0, { cast: false }));
+
+  // A escala del puesto, con un leve descuadre como en la vida real.
+  const along = c.w >= c.d;
+  // Sombra de contacto: la penumbra que queda debajo del carro y lo "asienta" en el piso.
+  const contact = new THREE.Mesh(new THREE.PlaneGeometry(m.length * 1.12, m.width * 1.2), contactShadow);
+  contact.rotation.x = -Math.PI / 2;
+  contact.position.y = 0.035;
+  car.add(contact);
+
+  const fit = Math.min(1, (Math.max(c.w, c.d) * 0.95) / m.length, (Math.min(c.w, c.d) * 0.88) / m.width);
+  car.scale.setScalar(fit);
+  car.position.set(c.cx + between(-0.12, 0.12), 0, c.cz + between(-0.08, 0.08));
+  car.rotation.y = (along ? 0 : Math.PI / 2) + (random() > 0.5 ? Math.PI : 0) + between(-0.035, 0.035);
+  scene.add(car);
+  return car;
+}
+
+function buildMotorcycle(c, index) {
+  const color = new THREE.MeshPhysicalMaterial({ color: ['#a11a2c', '#1f3a7a', '#1c1e22', '#d98a12'][index % 4], roughness: 0.28, metalness: 0.5, clearcoat: 1 });
+  const metal = new THREE.MeshStandardMaterial({ color: '#9aa0a6', roughness: 0.35, metalness: 0.9 });
+  const moto = new THREE.Group();
+  for (const sx of [-0.68, 0.68]) {
+    moto.add(mesh(new THREE.TorusGeometry(0.29, 0.085, 10, 24), tyre, sx, 0.37, 0));
+    moto.add(mesh(new THREE.CylinderGeometry(0.2, 0.2, 0.05, 16), rim, sx, 0.37, 0).rotateX(Math.PI / 2));
+  }
+  moto.add(mesh(new THREE.BoxGeometry(0.55, 0.3, 0.3), metal, 0.02, 0.48, 0));                    // motor
+  moto.add(mesh(new THREE.CapsuleGeometry(0.15, 0.36, 6, 12), color, 0.16, 0.86, 0).rotateZ(Math.PI / 2 - 0.12)); // tanque
+  moto.add(mesh(new THREE.BoxGeometry(0.62, 0.1, 0.27), trim, -0.36, 0.86, 0));                    // sillín
+  moto.add(mesh(new THREE.BoxGeometry(0.34, 0.07, 0.2), color, -0.68, 0.76, 0).rotateZ(0.25));     // guardabarro trasero
+  moto.add(mesh(new THREE.CylinderGeometry(0.035, 0.035, 0.78, 8), metal, 0.56, 0.72, 0).rotateZ(0.42)); // horquilla
+  moto.add(mesh(new THREE.CylinderGeometry(0.025, 0.025, 0.62, 8), trim, 0.42, 1.08, 0).rotateX(Math.PI / 2)); // manubrio
+  moto.add(mesh(new THREE.SphereGeometry(0.1, 12, 10), headlight, 0.52, 0.96, 0, { cast: false }));
+  moto.add(mesh(new THREE.CylinderGeometry(0.04, 0.05, 0.7, 8), metal, -0.4, 0.42, 0.16).rotateZ(Math.PI / 2 - 0.1)); // exosto
+
+  const along = c.w >= c.d;
+  moto.position.set(c.cx, 0, c.cz);
+  moto.rotation.y = (along ? 0 : Math.PI / 2) + between(-0.1, 0.1);
+  moto.rotation.x = 0.1;                                                                           // recostada en la pata
+  scene.add(moto);
+  return moto;
+}
+
+const vehicles = new Map();
+cells.forEach((c, index) => {
+  outline(c);
+  groundLabel(c);
+  if (c.occupied) { vehicles.set(c.number, c.type === 'MOTORCYCLE' ? buildMotorcycle(c, index) : buildCar(c, index)); }
+});
+
+// Flecha de circulación pintada cerca de la entrada.
+{
+  const arrow = new THREE.Shape([[0, 1.6], [0.75, 0.5], [0.25, 0.5], [0.25, -1.4], [-0.25, -1.4], [-0.25, 0.5], [-0.75, 0.5]].map(([x, y]) => new THREE.Vector2(x, y)));
+  flat(new THREE.ShapeGeometry(arrow), paint, entrance.x, 0.03, lot.z1 + 2.2, schematic);
+}
+
+// --- edificio del costado: corredor de columnas blancas y techo de teja -------
+function arcadeBuilding() {
+  const building = new THREE.Group();
+  const z0 = lot.z0 - 3, z1 = lot.z1 + 9, length = z1 - z0, zc = (z0 + z1) / 2;
+  const xFront = lot.x1 + 3.4, corridor = 3.2, depth = 9;
+  const white = new THREE.MeshStandardMaterial({ color: '#f4f1ea', roughness: 0.85 });
+  const wall = scanned(new THREE.MeshStandardMaterial({ map: brickTexture(length / 3, 1.2), roughness: 0.95, envMapIntensity: 0.3 }), 'brick_wall_02', length / 2.2, 1.4);
+
+  building.add(mesh(new THREE.BoxGeometry(depth, 3.1, length), wall, xFront + corridor + depth / 2, 1.55, zc, { receive: true }));
+  building.add(mesh(new THREE.BoxGeometry(corridor + 0.6, 0.16, length), new THREE.MeshStandardMaterial({ color: '#9c5a45', roughness: 0.9 }), xFront + corridor / 2 - 0.1, 0.08, zc, { receive: true }));
+  // Columnas con sus dos riostras en "Y", como las del corredor real.
+  for (let z = z0 + 0.6; z <= z1 - 0.5; z += 3.1) {
+    building.add(mesh(new THREE.BoxGeometry(0.34, 2.75, 0.34), white, xFront, 1.5, z));
+    for (const side of [-1, 1]) {
+      const brace = mesh(new THREE.BoxGeometry(0.16, 1.15, 0.16), white, xFront, 2.42, z + side * 0.42);
+      brace.rotation.x = -side * 0.72;
+      building.add(brace);
+    }
+  }
+  building.add(mesh(new THREE.BoxGeometry(0.3, 0.3, length), white, xFront, 2.98, zc));
+
+  // Techo a dos aguas de teja de barro, con alero sobre el corredor.
+  const roofTile = scanned(relief(new THREE.MeshStandardMaterial({ map: tileTexture(length / 2.2, 4), roughness: 0.85, envMapIntensity: 0.35, side: THREE.DoubleSide }), 4), 'clay_roof_tiles_02', 3.2, length / 2.4);
+  const span = corridor + depth + 1.4, rise = 2.5, half = span / 2;
+  const slopeLength = Math.hypot(half, rise), pitch = Math.atan2(rise, half);
+  const ridgeX = xFront - 0.9 + half;
+  for (const side of [-1, 1]) {
+    const pane = mesh(new THREE.BoxGeometry(slopeLength + 0.3, 0.14, length + 1.4), roofTile, ridgeX + side * half / 2, 3.12 + rise / 2, zc, { receive: true });
+    pane.rotation.z = -side * pitch;
+    building.add(pane);
+  }
+  building.add(mesh(new THREE.CylinderGeometry(0.16, 0.16, length + 1.5, 10), new THREE.MeshStandardMaterial({ color: '#8f452e', roughness: 0.9 }), ridgeX, 3.12 + rise + 0.05, zc).rotateX(Math.PI / 2));
+  for (const z of [z0, z1]) {
+    const gable = new THREE.Shape([new THREE.Vector2(-depth / 2, 0), new THREE.Vector2(depth / 2, 0), new THREE.Vector2(0, rise * depth / span)]);
+    building.add(mesh(new THREE.ShapeGeometry(gable), new THREE.MeshStandardMaterial({ color: '#efe9dd', roughness: 0.9, side: THREE.DoubleSide }), xFront + corridor + depth / 2, 3.1, z));
+  }
+  scene.add(building);
+}
+
+// Casa de arcos al fondo a la derecha y bloque moderno más lejos.
+function backBuildings() {
+  const white = new THREE.MeshStandardMaterial({ color: '#f2efe8', roughness: 0.9 });
+  const tile = new THREE.MeshStandardMaterial({ map: tileTexture(8, 3), roughness: 0.9, side: THREE.DoubleSide });
+  const house = new THREE.Group();
+  house.add(mesh(new THREE.BoxGeometry(20, 3.4, 9), white, 0, 1.7, 0));
+  for (let x = -8.4; x <= 8.4; x += 2.8) {
+    const arch = new THREE.Shape();
+    arch.moveTo(-0.95, 0); arch.lineTo(-0.95, 1.5); arch.absarc(0, 1.5, 0.95, Math.PI, 0, true); arch.lineTo(0.95, 0);
+    house.add(mesh(new THREE.ShapeGeometry(arch), new THREE.MeshStandardMaterial({ color: '#4a3b34', roughness: 1 }), x, 0.1, 4.52, { cast: false }));
+  }
+  for (const side of [-1, 1]) {
+    const pane = mesh(new THREE.BoxGeometry(21.5, 0.14, 5.9), tile, 0, 4.45, side * 2.6);
+    pane.rotation.x = side * 0.42;
+    house.add(pane);
+  }
+  house.position.set(lot.x1 + 16, 0, lot.z0 - 34);
+  house.rotation.y = -0.35;
+  scene.add(house);
+
+  const block = new THREE.Group();
+  block.add(mesh(new THREE.BoxGeometry(30, 8, 16), new THREE.MeshStandardMaterial({ color: '#d9d4c8', roughness: 0.9 }), 0, 4, 0));
+  block.add(mesh(new THREE.BoxGeometry(12, 8.6, 16.2), new THREE.MeshStandardMaterial({ color: '#a35842', roughness: 0.9 }), 9, 4.3, 0));
+  block.add(mesh(new THREE.BoxGeometry(31, 0.5, 17), new THREE.MeshStandardMaterial({ color: '#8d9196', roughness: 0.7 }), 0, 8.4, 0));
+  block.position.set(lotCx + 8, 0, lot.z0 - 74);
+  scene.add(block);
+}
+
+// --- vegetación ----------------------------------------------------------------
+const barkTexture = canvasTexture(128, (g, size) => {
+  g.fillStyle = '#6f5c4a';
+  g.fillRect(0, 0, size, size);
+  for (let i = 0; i < 500; i += 1) {
+    g.fillStyle = shade(between(22, 34), between(14, 26), between(20, 42));
+    g.fillRect(between(0, size), between(0, size), between(1, 3), between(6, 22));
+  }
+}, 2, 3);
+const bark = relief(new THREE.MeshStandardMaterial({ map: barkTexture, roughness: 1, envMapIntensity: 0.2 }), 3);
+
+// Follaje: manchas de hojas claras y oscuras; el mismo dibujo da el relieve.
+const foliageTexture = (hue) => canvasTexture(256, (g, size) => {
+  g.fillStyle = shade(hue, 40, 24);
+  g.fillRect(0, 0, size, size);
+  for (let i = 0; i < 2600; i += 1) {
+    g.fillStyle = shade(hue + between(-14, 14), between(30, 52), between(16, 46));
+    g.beginPath();
+    g.ellipse(between(0, size), between(0, size), between(2, 6), between(1, 3), between(0, Math.PI), 0, Math.PI * 2);
+    g.fill();
+  }
+}, 3, 2);
+const foliage = [104, 96, 116, 88].map((hue) => relief(new THREE.MeshStandardMaterial({ map: foliageTexture(hue), roughness: 0.95, envMapIntensity: 0.25 }), 5));
+const blossom = relief(new THREE.MeshStandardMaterial({ map: canvasTexture(256, (g, size) => {
+  g.fillStyle = '#c9a3ad';
+  g.fillRect(0, 0, size, size);
+  for (let i = 0; i < 2600; i += 1) {
+    g.fillStyle = random() > 0.3 ? shade(between(335, 352), between(35, 60), between(70, 90)) : shade(105, 35, between(25, 40));
+    g.fillRect(between(0, size), between(0, size), between(2, 6), between(2, 5));
+  }
+}, 3, 2), roughness: 0.95, envMapIntensity: 0.25 }), 5);
+
+// Hoja de palma dibujada: nervio central y folíolos que se acortan hacia la punta.
+const frondTexture = canvasTexture(256, (g, size) => {
+  g.clearRect(0, 0, size, size);
+  g.lineCap = 'round';
+  for (let i = 0; i < 90; i += 1) {
+    const x = 6 + (i / 90) * (size - 14), reach = (size * 0.46) * (1 - Math.pow(i / 90, 2.2)) + 6;
+    g.strokeStyle = shade(between(88, 112), between(38, 55), between(22, 40));
+    g.lineWidth = between(2, 3.6);
+    for (const dir of [-1, 1]) {
+      g.beginPath();
+      g.moveTo(x, size / 2);
+      g.lineTo(x + reach * 0.35, size / 2 + dir * reach);
+      g.stroke();
+    }
+  }
+  g.strokeStyle = '#6f7a3c';
+  g.lineWidth = 4;
+  g.beginPath(); g.moveTo(0, size / 2); g.lineTo(size, size / 2); g.stroke();
+});
+frondTexture.wrapS = frondTexture.wrapT = THREE.ClampToEdgeWrapping;
+const frondMaterial = new THREE.MeshStandardMaterial({ map: frondTexture, alphaTest: 0.35, side: THREE.DoubleSide, roughness: 0.8, envMapIntensity: 0.3 });
+const trunkRings = relief(new THREE.MeshStandardMaterial({ map: canvasTexture(128, (g, size) => {
+  g.fillStyle = '#a59c8c';
+  g.fillRect(0, 0, size, size);
+  for (let y = 0; y < size; y += 9) { g.fillStyle = `rgb(60 50 40 / ${between(0.18, 0.4)})`; g.fillRect(0, y, size, between(1.5, 3)); }
+}, 1, 5), roughness: 0.9, envMapIntensity: 0.2 }), 3);
+
+function palm(x, z, height) {
+  const tree = new THREE.Group();
+  const lean = between(-0.6, 0.6);
+  const top = new THREE.Vector3(lean * 0.5, height, 0);
+  const curve = new THREE.QuadraticBezierCurve3(new THREE.Vector3(0, 0, 0), new THREE.Vector3(lean, height * 0.55, 0), top);
+  tree.add(mesh(new THREE.TubeGeometry(curve, 14, 0.25, 12), trunkRings));
+  tree.add(mesh(new THREE.CapsuleGeometry(0.2, 1.1, 6, 12), new THREE.MeshStandardMaterial({ color: '#7f9a4f', roughness: 0.7 }), top.x, height + 0.4, 0));   // capitel verde
+  for (let i = 0; i < 18; i += 1) {
+    const length = between(3.6, 4.8), droop = between(1.4, 2.6);
+    const leaf = new THREE.PlaneGeometry(length, 1.5, 12, 2);
+    const position = leaf.attributes.position;
+    for (let v = 0; v < position.count; v += 1) {
+      const t = position.getX(v) / length + 0.5;
+      position.setXYZ(v, t * length, position.getY(v), -t * t * droop - Math.abs(position.getY(v)) * 0.45);   // se curva y se pliega en V
+    }
+    leaf.computeVertexNormals();
+    const frond = mesh(leaf, frondMaterial);
+    frond.rotation.x = -Math.PI / 2;
+    const holder = group(frond);
+    holder.rotation.set(0, (i / 18) * Math.PI * 2 + between(-0.2, 0.2), i % 3 === 0 ? between(-0.25, 0.05) : between(0.1, 0.6));
+    holder.position.set(top.x, height + 0.9, 0);
+    tree.add(holder);
+  }
+  tree.position.set(x, 0, z);
+  tree.rotation.y = between(0, Math.PI * 2);
+  scene.add(tree);
+}
+
+function leafyTree(x, z, scale, flowering = false) {
+  const tree = new THREE.Group();
+  const trunkHeight = between(3.2, 4.2) * scale;
+  tree.add(mesh(new THREE.CylinderGeometry(0.2 * scale, 0.38 * scale, trunkHeight, 10), bark, 0, trunkHeight / 2, 0));
+  const leaves = flowering ? blossom : foliage[Math.floor(between(0, foliage.length - 0.01))];
+  for (let i = 0; i < 11; i += 1) {
+    // Esferas suaves y deformadas que se traslapan: una copa irregular, sin caras planas.
+    const blob = new THREE.SphereGeometry(between(1.2, 2.1) * scale, 20, 14);
+    const position = blob.attributes.position, phase = between(0, 6);
+    for (let v = 0; v < position.count; v += 1) {
+      const px = position.getX(v), py = position.getY(v), pz = position.getZ(v);
+      const wobble = 1 + 0.13 * Math.sin(px * 2.3 + phase) * Math.cos(pz * 2.1 - phase) + 0.07 * Math.sin(py * 4.1 + phase * 2);
+      position.setXYZ(v, px * wobble, py * wobble * 0.82, pz * wobble);
+    }
+    const angle = between(0, Math.PI * 2), radius = i === 0 ? 0 : between(0.6, 2.2) * scale;
+    const part = mesh(blob, i % 4 === 3 && !flowering ? foliage[(i + 1) % foliage.length] : leaves,
+      Math.cos(angle) * radius, trunkHeight + between(0.2, 2.6) * scale, Math.sin(angle) * radius);
+    // una rama hacia cada masa de hojas
+    const branch = mesh(new THREE.CylinderGeometry(0.05 * scale, 0.11 * scale, 2.2 * scale, 6), bark, part.position.x / 2, trunkHeight - 0.2 * scale, part.position.z / 2);
+    branch.rotation.set(Math.sin(angle) * 0.6, 0, -Math.cos(angle) * 0.6);
+    tree.add(part, branch);
+  }
+  tree.position.set(x, 0, z);
+  scene.add(tree);
+}
+
+function lampPost(x, z) {
+  const metal = new THREE.MeshStandardMaterial({ color: '#70757b', roughness: 0.5, metalness: 0.7 });
+  scene.add(mesh(new THREE.CylinderGeometry(0.07, 0.1, 6.2, 10), metal, x, 3.1, z));
+  scene.add(mesh(new THREE.BoxGeometry(1.1, 0.07, 0.07), metal, x + 0.5, 6.15, z));
+  scene.add(mesh(new THREE.BoxGeometry(0.5, 0.1, 0.24), new THREE.MeshStandardMaterial({ color: '#f5f1dc', emissive: '#fff3c0', emissiveIntensity: 0.4 }), x + 1.0, 6.08, z));
+}
+
+arcadeBuilding();
+backBuildings();
+// Palmas altas del costado izquierdo y la arboleda del fondo, con el árbol florecido del centro.
+[[-6.5, 4, 11], [-8, -3, 12.5], [-5.5, -9, 10.5], [-9.5, 9, 9.5]].forEach(([dx, z, h]) => palm(lot.x0 + dx, lotCz + z, h));
+for (let i = 0; i < 9; i += 1) {
+  leafyTree(lot.x0 - 2 + i * 4.4 + between(-0.8, 0.8), lot.z0 - between(6, 9), between(1.15, 1.55), i === 5);
+  leafyTree(lot.x0 - 6 + i * 5 + between(-1, 1), lot.z0 - between(13, 18), between(1.3, 1.8));
+}
+for (let i = 0; i < 7; i += 1) { leafyTree(lot.x0 - between(12, 19), lot.z0 + i * 6 + between(-1, 1), between(1.1, 1.6)); }
+lampPost(lot.x1 + 1.6, lot.z0 - 1.5);
+lampPost(lot.x0 - 1.8, lotCz + 2);
+
+function billboard(text, options, height) {
+  const { texture: map, ratio } = textTexture(text, options);
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map, depthTest: false, toneMapped: false }));
+  sprite.scale.set(height * ratio, height, 1);
+  sprite.renderOrder = 10;
+  return sprite;
+}
+const entranceLabel = billboard('Entrada', { size: 46, background: '#32151b' }, 1.1);
+entranceLabel.position.copy(entrance).setY(2.2);
+scene.add(entranceLabel);
+
+// --- puesto asignado ---------------------------------------------------------
+const highlight = new THREE.Group();
+scene.add(highlight);
+let pin = null, ring = null, traveller = null, routeCurve = null, selected = null;
+
+function routeTo(c) {
+  const lane = nearestAisle(c);
+  const y = 0.13;
+  const points = [entrance.clone().setY(y), new THREE.Vector3(lane, y, lot.z1 + 2.2)];
+  if (c.w > c.d * 1.3) {
+    points.push(new THREE.Vector3(lane, y, c.cz), new THREE.Vector3(c.cx + Math.sign(lane - c.cx) * c.w * 0.25, y, c.cz));
+  } else {
+    points.push(new THREE.Vector3(lane, y, c.y1 + 1.6), new THREE.Vector3(c.cx, y, c.y1 + 1.6), new THREE.Vector3(c.cx, y, c.cz + c.d * 0.2));
+  }
+  const path = new THREE.CurvePath();
+  for (let i = 1; i < points.length; i += 1) { path.add(new THREE.LineCurve3(points[i - 1], points[i])); }
+  return { path, lane };
+}
+
+function select(number) {
+  const c = cells.find((cell) => cell.number === number) ?? cells[0];
+  selected = c;
+  // El puesto asignado se muestra vacío: es donde va a parquear.
+  vehicles.forEach((vehicle, vehicleNumber) => { vehicle.visible = !photo.visible && vehicleNumber !== c.number; });
+  highlight.clear();
+
+  const green = new THREE.MeshStandardMaterial({ color: '#13c27a', emissive: '#0a8f58', emissiveIntensity: 0.7, transparent: true, opacity: 0.8 });
+  const plate = mesh(new THREE.BoxGeometry(c.w - 0.15, 0.07, c.d - 0.15), green, c.cx, 0.07, c.cz, { cast: false });
+  ring = new THREE.Mesh(new THREE.RingGeometry(0.85, 1.0, 48), new THREE.MeshBasicMaterial({ color: '#13c27a', transparent: true, side: THREE.DoubleSide, depthWrite: false }));
+  ring.rotation.x = -Math.PI / 2;
+  ring.position.set(c.cx, 0.13, c.cz);
+  const beam = new THREE.Mesh(new THREE.CylinderGeometry(0.45, 0.9, 9, 24, 1, true),
+    new THREE.MeshBasicMaterial({ color: '#2ee6a0', transparent: true, opacity: 0.16, side: THREE.DoubleSide, depthWrite: false }));
+  beam.position.set(c.cx, 4.5, c.cz);
+
+  pin = new THREE.Group();
+  const red = new THREE.MeshPhysicalMaterial({ color: '#c1122c', roughness: 0.3, clearcoat: 0.8 });
+  const tip = mesh(new THREE.ConeGeometry(0.5, 1.15, 24), red, 0, 0.45, 0);
+  tip.rotation.x = Math.PI;
+  const label = billboard(c.number, { size: 60, color: '#b5122b', background: '#ffffff' }, 1.25);
+  label.position.y = 2.75;
+  pin.add(mesh(new THREE.SphereGeometry(0.62, 24, 16), red, 0, 1.15, 0), tip, label);
+  pin.position.set(c.cx, 2.2, c.cz);
+
+  const { path } = routeTo(c);
+  routeCurve = path;
+  const route = new THREE.Mesh(new THREE.TubeGeometry(path, 160, 0.13, 8), new THREE.MeshBasicMaterial({ color: '#ffd23f', toneMapped: false }));
+  traveller = new THREE.Mesh(new THREE.SphereGeometry(0.34, 16, 12), new THREE.MeshBasicMaterial({ color: '#ffffff', toneMapped: false }));
+  highlight.add(plate, ring, beam, pin, route, traveller);
+
+  document.getElementById('puesto').textContent = c.number;
+  document.getElementById('zona').textContent = (c.zone || 'Zona general') + (c.type === 'MOTORCYCLE' ? ' · Motocicleta' : ' · Automóvil');
+  document.getElementById('otro').value = c.number;
+}
+
+// --- cámara ------------------------------------------------------------------
+let flight = null;
+function flyTo(position, target, seconds = 1.8) {
+  flight = { from: camera.position.clone(), fromTarget: controls.target.clone(), to: position, toTarget: target, start: performance.now(), duration: seconds * 1000 };
+}
+const lotCenter = new THREE.Vector3(lotCx, 0, lotCz);
+const overviewPosition = () => new THREE.Vector3(lotCx - 6, 30, lotCz + 44);
+function overview(seconds) { flyTo(overviewPosition(), lotCenter.clone(), seconds); }
+function focus(seconds) {
+  const c = selected;
+  const side = Math.sign(nearestAisle(c) - c.cx) || 1;
+  const offset = c.w > c.d * 1.3 ? new THREE.Vector3(side * 10, 7.5, 9.5) : new THREE.Vector3(3, 7.5, 13);
+  flyTo(new THREE.Vector3(c.cx, 0, c.cz).add(offset), new THREE.Vector3(c.cx, 0.8, c.cz), seconds);
+}
+
+// --- controles de la página --------------------------------------------------
+const picker = document.getElementById('otro');
+[...cells].sort((a, b) => a.number.localeCompare(b.number, 'es', { numeric: true })).forEach((c) => picker.add(new Option(c.number, c.number)));
+picker.addEventListener('change', () => { select(picker.value); focus(); });
+document.getElementById('ir').addEventListener('click', () => focus());
+document.getElementById('general').addEventListener('click', () => overview());
+// Con la foto de piso se quitan los carros 3D: la foto ya trae los suyos y se verían dobles.
+function setPhoto(on) {
+  photo.visible = photoShadow.visible = on;
+  schematic.visible = !on;
+  vehicles.forEach((vehicle, number) => { vehicle.visible = !on && number !== selected?.number; });
+  document.getElementById('foto').checked = on;
+}
+document.getElementById('foto').addEventListener('change', (event) => setPhoto(event.target.checked));
+
+function resize() {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize);
+resize();
+
+const wanted = new URLSearchParams(location.search).get('puesto');
+const firstFree = cells.find((c) => !c.occupied && c.type === 'CAR') ?? cells[0];
+setPhoto(false);
+select(cells.some((c) => c.number === wanted) ? wanted : firstFree.number);
+camera.position.copy(overviewPosition());
+controls.target.copy(lotCenter);
+setTimeout(() => focus(2.6), 900);            // entra con vista general y vuela al puesto
+
+const ease = (t) => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
+renderer.setAnimationLoop((now) => {
+  if (flight) {
+    const t = Math.min(1, (now - flight.start) / flight.duration);
+    camera.position.lerpVectors(flight.from, flight.to, ease(t));
+    controls.target.lerpVectors(flight.fromTarget, flight.toTarget, ease(t));
+    if (t === 1) { flight = null; }
+  }
+  const seconds = now / 1000;
+  if (pin) { pin.position.y = 2.2 + Math.sin(seconds * 2.2) * 0.22; }
+  if (ring) {
+    const pulse = (seconds * 0.7) % 1;
+    ring.scale.setScalar(1 + pulse * 1.6);
+    ring.material.opacity = 0.85 * (1 - pulse);
+  }
+  if (traveller && routeCurve) { traveller.position.copy(routeCurve.getPointAt((seconds * 0.16) % 1)); }
+  controls.update();
+  renderer.render(scene, camera);
+});
+
+// Para pruebas y para integrarlo después: window.demo.select('AR-05'), focus(), overview(), setPhoto(false).
+window.demo = { select, focus, overview, setPhoto, cells, vehicles, THREE, sun, scene, renderer };
+</script>
+</body>
+</html>
