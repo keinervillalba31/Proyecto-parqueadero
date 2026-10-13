@@ -82,6 +82,26 @@ python run_service.py
 
 (El comando anterior, `python -m uvicorn api_video:app --app-dir scripts ...`, sigue funcionando.)
 
+**Sin comandos: el panel.** Doble clic en `Abrir panel.bat`: enciende el servicio si no lo
+estaba (sin consola) y abre el panel en el navegador, `http://localhost:8000/`. Desde otro
+equipo de la red se entra con `http://<este-servidor>:8000/`. El panel muestra el video, las
+celdas y la última placa, y tiene un interruptor para cada cosa:
+
+- **Espacios**: detección de celdas libres y ocupadas. Apagado, se conservan los últimos
+  datos y deja de enviarse la ocupación al backend.
+- **Placas**: lectura de placas. Apagado, no se hacen consultas a Roboflow.
+
+**Desde la plataforma.** Con `BACKEND_SYNC_ENABLED=true`, los mismos dos interruptores están
+en la página **Monitoreo** (los puede mover quien tenga el permiso `MONITORING_MANAGE`). El
+servicio consulta `GET /api/monitoring/services` cada `BACKEND_SERVICES_POLL_SECONDS` y obedece
+lo que diga la plataforma; un cambio hecho en el panel local se guarda también allá, así que
+los dos siempre muestran lo mismo.
+
+El video se sigue transmitiendo aunque los dos estén apagados. Lo que se deja encendido o
+apagado se guarda en `servicios_activos.json` y se respeta al reiniciar. Cuando el servicio
+arranca sin consola, sus mensajes quedan en `servicio.log`. El panel no pide usuario, igual
+que el resto de la API: cualquiera que alcance el puerto puede usar los interruptores.
+
 **Cámara con video de respaldo.** Pon la cámara en `VIDEO_SOURCE` (por ejemplo
 `rtsp://usuario:clave@192.168.1.20/stream`) y un video corto en `VIDEO_FALLBACK`.
 Si la cámara no responde, el servicio reproduce ese video en bucle sin parar y
@@ -152,6 +172,9 @@ Las pruebas simulan YOLO, así que no necesitan GPU ni video.
 
 ## Endpoints
 
+- `GET /`: panel del operador.
+- `GET /servicios`: qué está encendido (`espacios`, `placas`). `POST /servicios` con
+  `{"espacios": true|false, "placas": true|false}` lo cambia; lo que no se envía no cambia.
 - `GET /snapshot`: cuadro actual sin dibujos (la plataforma lo usa para trazar celdas).
 - `GET /video/parqueadero` (`/video`): video en vivo del parqueadero.
 - `GET /video/placas`: video en vivo de la fuente independiente de placas (`PLATE_VIDEO_SOURCE`).

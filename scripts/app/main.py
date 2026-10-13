@@ -4,18 +4,29 @@ import asyncio
 import time
 from collections.abc import Callable
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import cv2
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
+from pydantic import BaseModel
 
 from .config import settings
 from .video_service import VideoService
 
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+PANEL_PATH = Path(__file__).resolve().parent / "panel.html"
+
+
+class ServicesChange(BaseModel):
+    """Lo que se quiere encender (true) o apagar (false); lo que no se envía no cambia."""
+
+    espacios: bool | None = None
+    placas: bool | None = None
+
 
 service = VideoService(settings)
 
@@ -28,6 +39,22 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Monitoreo de parqueadero", lifespan=lifespan)
+
+
+@app.get("/", include_in_schema=False)
+def panel() -> FileResponse:
+    """Panel del operador: video, estado e interruptores de espacios y placas."""
+    return FileResponse(PANEL_PATH, media_type="text/html", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/servicios")
+def services() -> dict[str, bool]:
+    return service.services()
+
+
+@app.post("/servicios")
+def change_services(change: ServicesChange) -> dict[str, bool]:
+    return service.set_services(spaces=change.espacios, plates=change.placas)
 
 
 @app.get("/health")

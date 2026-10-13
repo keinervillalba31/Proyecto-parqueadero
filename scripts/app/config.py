@@ -76,6 +76,8 @@ class Settings:
     video_camera_retry_seconds: float = float(os.getenv("VIDEO_CAMERA_RETRY_SECONDS", "10"))
     service_host: str = os.getenv("SERVICE_HOST", "0.0.0.0")
     service_port: int = int(os.getenv("SERVICE_PORT", "8000"))
+    # Dónde se guarda lo que el operador dejó encendido o apagado desde el panel.
+    services_state_path: Path = project_path("SERVICES_STATE", PROJECT_DIR / "servicios_activos.json")
     roboflow_workspace: str = os.getenv("ROBOFLOW_WORKSPACE", "")
     roboflow_workflow: str = os.getenv("ROBOFLOW_WORKFLOW", "")
 
@@ -99,6 +101,8 @@ class Settings:
         int(os.getenv("BACKEND_CAMERA_ID")) if os.getenv("BACKEND_CAMERA_ID") else None
     )
     backend_cells_poll_seconds: float = float(os.getenv("BACKEND_CELLS_POLL_SECONDS", "15"))
+    # Cada cuánto se consulta qué encendió o apagó el operador en la plataforma (espacios, placas).
+    backend_services_poll_seconds: float = float(os.getenv("BACKEND_SERVICES_POLL_SECONDS", "3"))
     # Cada cuánto se revisa si cambió la ocupación de las celdas para enviarla al backend.
     # Aunque no cambie, se reenvía cada BACKEND_OCCUPANCY_RESEND_SECONDS por si el backend
     # se reinició o alguien cambió un puesto a mano.

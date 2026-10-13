@@ -194,6 +194,37 @@ class BackendClient:
             )
         return response.json().get("data", {})
 
+    @staticmethod
+    def _services_from(response: requests.Response) -> dict[str, bool]:
+        data = response.json().get("data") or {}
+        return {
+            "espacios": bool(data.get("spacesEnabled", True)),
+            "placas": bool(data.get("platesEnabled", True)),
+        }
+
+    def get_services(self) -> dict[str, bool]:
+        """Qué dejó encendido el operador en la plataforma (Monitoreo)."""
+        response = self._request("GET", "/api/monitoring/services")
+        if response.status_code != 200:
+            raise BackendError(
+                f"No se pudieron consultar los servicios de detección "
+                f"({response.status_code}): {response.text[:200]}"
+            )
+        return self._services_from(response)
+
+    def set_services(self, spaces: bool | None, plates: bool | None) -> dict[str, bool]:
+        """Guarda en la plataforma un cambio hecho desde el panel local (None = no cambiar)."""
+        response = self._mutating_request(
+            "PATCH",
+            "/api/monitoring/services",
+            json={"spacesEnabled": spaces, "platesEnabled": plates},
+        )
+        if response.status_code != 200:
+            raise BackendError(
+                f"El backend rechazó el cambio de servicios ({response.status_code}): {response.text[:200]}"
+            )
+        return self._services_from(response)
+
     def list_students(self, force_refresh: bool = False) -> list[dict[str, Any]]:
         age = time.monotonic() - self._students_cache_at
         if not force_refresh and self._students_cache and age < self.settings.backend_students_cache_seconds:

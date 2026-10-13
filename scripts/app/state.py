@@ -29,6 +29,8 @@ class RuntimeState:
             },
             # Cuadros por segundo del video en vivo y de los análisis de YOLO.
             "rendimiento": {"fps_video": 0.0, "fps_analisis": 0.0},
+            # Lo que está encendido desde el panel.
+            "servicios": {"espacios": True, "placas": True},
             "placa": {
                 "valor": None,
                 "lecturas": [],
@@ -52,7 +54,18 @@ class RuntimeState:
             placa = self.data["placa"]
             fuente = self.data["fuente"]
             rendimiento = self.data["rendimiento"]
-            self.data = {**data, "placa": placa, "fuente": fuente, "rendimiento": rendimiento}
+            servicios = self.data["servicios"]
+            self.data = {
+                **data,
+                "placa": placa,
+                "fuente": fuente,
+                "rendimiento": rendimiento,
+                "servicios": servicios,
+            }
+
+    def update_services(self, services: dict[str, bool]) -> None:
+        with self.lock:
+            self.data["servicios"] = dict(services)
 
     def update_performance(self, changes: dict[str, Any]) -> None:
         with self.lock:

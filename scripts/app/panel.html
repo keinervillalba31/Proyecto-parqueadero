@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Panel del parqueadero</title>
+<style>
+  :root {
+    --fondo: #f3f5f8; --tarjeta: #ffffff; --texto: #17202e; --tenue: #5d6b7e; --borde: #dbe1ea;
+    --libre: #1f9d55; --ocupado: #d64545; --reservado: #c98a00; --acento: #2563eb; --apagado: #9aa5b4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fondo: #10151d; --tarjeta: #1a212c; --texto: #e8edf4; --tenue: #9aa7b8; --borde: #2c3644;
+      --libre: #3ecf7c; --ocupado: #ff6b6b; --reservado: #f0b429; --acento: #5b9bff; --apagado: #5a6676;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--fondo); color: var(--texto); font: 16px/1.45 "Segoe UI", system-ui, sans-serif; }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; padding: 16px 20px; }
+  h1 { font-size: 1.3rem; margin: 0; flex: 1 1 auto; }
+  h2 { font-size: 1.15rem; margin: 0; }
+  .insignia { padding: 4px 12px; border-radius: 999px; border: 1px solid var(--borde); font-size: .85rem; color: var(--tenue); }
+  .insignia.bien { color: var(--libre); border-color: var(--libre); }
+  .insignia.mal { color: var(--ocupado); border-color: var(--ocupado); }
+  #aviso { margin: 0 20px 12px; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--ocupado); color: var(--ocupado); }
+  main { display: grid; gap: 16px; padding: 0 20px 24px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); }
+  .tarjeta { background: var(--tarjeta); border: 1px solid var(--borde); border-radius: 12px; padding: 16px; display: flex; flex-direction: column; gap: 14px; }
+  .cabecera { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .cabecera p { margin: 2px 0 0; color: var(--tenue); font-size: .9rem; }
+  .interruptor { display: flex; align-items: center; gap: 10px; background: none; border: 0; color: var(--texto); font: inherit; font-weight: 600; cursor: pointer; padding: 6px; border-radius: 8px; }
+  .interruptor:focus-visible { outline: 2px solid var(--acento); }
+  .interruptor:disabled { opacity: .6; cursor: wait; }
+  .interruptor .riel { width: 52px; height: 30px; border-radius: 999px; background: var(--apagado); position: relative; transition: background .15s; flex: none; }
+  .interruptor .riel::after { content: ""; position: absolute; top: 3px; left: 3px; width: 24px; height: 24px; border-radius: 50%; background: #fff; transition: transform .15s; }
+  .interruptor[aria-checked="true"] .riel { background: var(--libre); }
+  .interruptor[aria-checked="true"] .riel::after { transform: translateX(22px); }
+  .video { position: relative; background: #000; border-radius: 8px; overflow: hidden; aspect-ratio: 16 / 9; }
+  .video img { position: relative; width: 100%; height: 100%; object-fit: contain; display: block; background: #000; }
+  .video span { position: absolute; inset: 0; display: grid; place-items: center; color: #b8c2d0; font-size: .9rem; text-align: center; padding: 12px; }
+  .cifras { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; text-align: center; }
+  .cifras div { border: 1px solid var(--borde); border-radius: 8px; padding: 8px 4px; }
+  .cifras b { display: block; font-size: 1.6rem; line-height: 1.2; }
+  .cifras small { color: var(--tenue); }
+  .celdas { display: flex; flex-wrap: wrap; gap: 6px; }
+  .celda { padding: 3px 10px; border-radius: 6px; border: 1px solid currentColor; font-size: .85rem; }
+  .libre { color: var(--libre); } .ocupado { color: var(--ocupado); } .reservado { color: var(--reservado); }
+  .pausado { opacity: .45; }
+  .placa { font: 700 2.2rem/1.1 Consolas, monospace; letter-spacing: .12em; padding: 10px; border: 2px solid var(--borde); border-radius: 8px; text-align: center; }
+  .dato { margin: 0; color: var(--tenue); }
+  .dato b { color: var(--texto); }
+  details { border-top: 1px solid var(--borde); padding-top: 10px; }
+  summary { cursor: pointer; color: var(--acento); }
+  details p { margin: 8px 0; color: var(--tenue); font-size: .9rem; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Panel del parqueadero</h1>
+  <span id="fuente" class="insignia" hidden></span>
+  <span id="conexion" class="insignia">Conectando…</span>
+</header>
+<div id="aviso" role="alert" hidden></div>
+
+<main>
+  <section class="tarjeta">
+    <div class="cabecera">
+      <div><h2>Espacios</h2><p>Detecta qué celdas están libres u ocupadas.</p></div>
+      <button class="interruptor" id="sw-espacios" role="switch" aria-checked="false" disabled>
+        <span class="riel"></span><span class="rotulo">—</span>
+      </button>
+    </div>
+    <div class="video"><span>Esperando el video…</span><img id="video-espacios" alt="Video del parqueadero" hidden></div>
+    <div id="datos-espacios">
+      <div class="cifras">
+        <div><b id="libres" class="libre">–</b><small>Libres</small></div>
+        <div><b id="ocupadas" class="ocupado">–</b><small>Ocupadas</small></div>
+        <div><b id="total">–</b><small>Total</small></div>
+      </div>
+      <p class="dato" id="resumen-espacios" style="margin-top:10px"></p>
+      <div class="celdas" id="celdas" style="margin-top:10px"></div>
+    </div>
+  </section>
+
+  <section class="tarjeta">
+    <div class="cabecera">
+      <div><h2>Placas</h2><p>Lee la placa de los vehículos que llegan.</p></div>
+      <button class="interruptor" id="sw-placas" role="switch" aria-checked="false" disabled>
+        <span class="riel"></span><span class="rotulo">—</span>
+      </button>
+    </div>
+    <div class="video" id="caja-video-placas" hidden><span>Esperando el video…</span><img id="video-placas" alt="Video de la cámara de placas" hidden></div>
+    <div id="datos-placas">
+      <div class="placa" id="placa">– – –</div>
+      <p class="dato" id="estado-placa" style="margin-top:10px"></p>
+      <p class="dato" id="celda-placa" hidden></p>
+      <p class="dato" id="plataforma-placa" hidden></p>
+    </div>
+    <details>
+      <summary>Probar con una foto</summary>
+      <p>Sube la foto de un vehículo para ver qué placa se lee. Funciona aunque la lectura esté apagada; cada foto es una consulta a Roboflow.</p>
+      <input type="file" id="foto" accept="image/*">
+      <p id="resultado-foto" aria-live="polite"></p>
+    </details>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+const ESTADOS_PLACA = {
+  esperando: "Esperando un vehículo",
+  leyendo: "Leyendo…",
+  sin_lectura: "No se ve ninguna placa",
+  sin_vehiculo: "Sin vehículos a la vista",
+  confirmando: "Confirmando la lectura…",
+  autorizado: "Vehículo registrado",
+  no_registrado: "Vehículo no registrado",
+  error_lectura: "No se pudo leer la placa",
+  detenido: "Lectura apagada",
+};
+
+let servicios = {};
+
+function pintarInterruptor(nombre) {
+  const boton = $("sw-" + nombre);
+  const encendido = !!servicios[nombre];
+  boton.setAttribute("aria-checked", String(encendido));
+  boton.querySelector(".rotulo").textContent = encendido ? "Encendido" : "Apagado";
+  $("datos-" + nombre).classList.toggle("pausado", !encendido);
+}
+
+async function alternar(nombre) {
+  const boton = $("sw-" + nombre);
+  boton.disabled = true;
+  try {
+    const respuesta = await fetch("/servicios", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ [nombre]: !servicios[nombre] }),
+    });
+    if (!respuesta.ok) throw new Error("HTTP " + respuesta.status);
+    servicios = await respuesta.json();
+    pintarInterruptor("espacios");
+    pintarInterruptor("placas");
+  } catch (error) {
+    avisar("No se pudo cambiar el interruptor: " + error.message);
+  } finally {
+    boton.disabled = false;
+  }
+}
+$("sw-espacios").addEventListener("click", () => alternar("espacios"));
+$("sw-placas").addEventListener("click", () => alternar("placas"));
+
+function avisar(texto) {
+  $("aviso").textContent = texto || "";
+  $("aviso").hidden = !texto;
+}
+
+function pintarEspacios(estado) {
+  $("libres").textContent = estado.libres ?? "–";
+  $("ocupadas").textContent = estado.ocupadas ?? "–";
+  $("total").textContent = estado.total_celdas ?? "–";
+  $("resumen-espacios").textContent = servicios.espacios
+    ? `Ocupación: ${estado.congestion_porcentaje ?? 0} % · Vehículos a la vista: ${estado.vehiculos_detectados ?? 0}`
+    : "Detección apagada: estos son los últimos datos que se vieron.";
+
+  const reservas = {};
+  for (const [placa, reserva] of Object.entries(estado.reservas || {})) reservas[reserva.celda] = placa;
+  const chips = Object.entries(estado.celdas || {}).map(([nombre, celda]) => {
+    const chip = document.createElement("span");
+    const tipo = ["libre", "ocupado", "reservado"].includes(celda.estado) ? celda.estado : "libre";
+    chip.className = "celda " + tipo;
+    chip.textContent = (celda.puesto || nombre) + (reservas[nombre] ? " · " + reservas[nombre] : "");
+    chip.title = tipo === "reservado" ? "Reservada para " + (reservas[nombre] || "") : tipo;
+    return chip;
+  });
+  $("celdas").replaceChildren(...chips);
+}
+
+function pintarPlaca(placa) {
+  $("placa").textContent = placa.valor || "– – –";
+  let texto = ESTADOS_PLACA[placa.estado] || placa.estado || "";
+  if (placa.estado === "confirmando" && placa.ultimo_resultado) texto += " (" + placa.ultimo_resultado + ")";
+  if (placa.estado === "error_lectura" && placa.error) texto += ": " + placa.error;
+  $("estado-placa").textContent = texto;
+
+  $("celda-placa").hidden = !placa.celda_asignada;
+  $("celda-placa").textContent = placa.celda_asignada ? "Celda asignada: " + placa.celda_asignada : "";
+
+  const plataforma = {
+    pendiente: "Enviando a la plataforma…",
+    prompted: "Se le pidió al estudiante elegir tiempo y puesto en la plataforma",
+    already_prompted: "El estudiante ya tiene el aviso para elegir tiempo y puesto",
+    sincronizado: "Guardado en la plataforma" + (placa.backend_puesto ? ": puesto " + placa.backend_puesto : ""),
+    error: "La plataforma no respondió" + (placa.backend_error ? ": " + placa.backend_error : ""),
+  };
+  const mostrar = placa.valor && placa.backend_estado && placa.backend_estado !== "deshabilitado";
+  $("plataforma-placa").hidden = !mostrar;
+  if (mostrar) {
+    $("plataforma-placa").textContent =
+      plataforma[placa.backend_estado] || "Plataforma: " + placa.backend_estado.replaceAll("_", " ");
+  }
+}
+
+function pintar(estado) {
+  servicios = estado.servicios || servicios;
+  for (const nombre of ["espacios", "placas"]) {
+    pintarInterruptor(nombre);
+    $("sw-" + nombre).disabled = false;
+  }
+  const fuente = estado.fuente || {};
+  $("fuente").hidden = !fuente.modo || fuente.modo === "iniciando";
+  $("fuente").textContent = fuente.modo === "respaldo" ? "Video de respaldo (cámara sin señal)" : "Cámara en línea";
+  $("fuente").className = "insignia " + (fuente.modo === "respaldo" ? "mal" : "bien");
+
+  // La cámara de placas es opcional: sin ella, las placas se leen del video del parqueadero.
+  if (fuente.placas_origen && $("caja-video-placas").hidden) {
+    $("caja-video-placas").hidden = false;
+    cargarVideo($("video-placas"), "/video/placas");
+  }
+  avisar(fuente.placas_error ? "Cámara de placas: " + fuente.placas_error : "");
+  pintarEspacios(estado);
+  pintarPlaca(estado.placa || {});
+}
+
+// Los videos son MJPEG: si se cortan (o aún no hay imagen), se vuelven a pedir.
+function cargarVideo(imagen, ruta) {
+  imagen.onload = () => { imagen.hidden = false; };
+  imagen.onerror = () => {
+    imagen.hidden = true;
+    setTimeout(() => cargarVideo(imagen, ruta), 3000);
+  };
+  imagen.src = ruta + "?t=" + Date.now();
+}
+
+function conectar() {
+  const protocolo = location.protocol === "https:" ? "wss" : "ws";
+  const socket = new WebSocket(`${protocolo}://${location.host}/ws/estado`);
+  socket.onopen = () => {
+    $("conexion").textContent = "Servicio en línea";
+    $("conexion").className = "insignia bien";
+    cargarVideo($("video-espacios"), "/video/parqueadero");
+    if (!$("caja-video-placas").hidden) cargarVideo($("video-placas"), "/video/placas");
+  };
+  socket.onmessage = (mensaje) => pintar(JSON.parse(mensaje.data));
+  socket.onclose = () => {
+    $("conexion").textContent = "Sin conexión con el servicio";
+    $("conexion").className = "insignia mal";
+    for (const nombre of ["espacios", "placas"]) $("sw-" + nombre).disabled = true;
+    setTimeout(conectar, 2000);
+  };
+}
+conectar();
+
+$("foto").addEventListener("change", async (evento) => {
+  const archivo = evento.target.files[0];
+  if (!archivo) return;
+  const salida = $("resultado-foto");
+  salida.textContent = "Leyendo la foto…";
+  const datos = new FormData();
+  datos.append("image", archivo);
+  try {
+    const respuesta = await fetch("/vision/license-plates", { method: "POST", body: datos });
+    const cuerpo = await respuesta.json();
+    if (!respuesta.ok) throw new Error(cuerpo.detail || "HTTP " + respuesta.status);
+    salida.textContent = cuerpo.plate
+      ? `Placa leída: ${cuerpo.plate} (${cuerpo.registered ? "registrada" : "no registrada"})`
+      : "No se encontró ninguna placa en la foto.";
+  } catch (error) {
+    salida.textContent = "No se pudo leer la foto: " + error.message;
+  }
+  evento.target.value = "";
+});
+</script>
+</body>
+</html>
