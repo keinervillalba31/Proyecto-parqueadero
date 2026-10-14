@@ -65,6 +65,8 @@ class Settings:
     # Espera corta cuando el backend respondió "por ahora no aplica" (el estudiante ya
     # tiene puesto, no hay cupo...): eso puede cambiar en segundos, así que se vuelve a consultar pronto.
     plate_recheck_seconds: float = float(os.getenv("PLATE_RECHECK_SECONDS", "4"))
+    # Tiempo máximo de cada consulta a Roboflow; sin él, una petición colgada detiene la lectura.
+    plate_ocr_timeout_seconds: float = float(os.getenv("PLATE_OCR_TIMEOUT_SECONDS", "30"))
     plate_require_vehicle: bool = os.getenv("PLATE_REQUIRE_VEHICLE", "true").lower() == "true"
     # Vacío = acepta cualquier texto. Por defecto, placas colombianas.
     plate_pattern: str = os.getenv("PLATE_PATTERN", DEFAULT_PLATE_PATTERN)
