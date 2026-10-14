@@ -3,6 +3,7 @@ uvicorn[standard]
 opencv-python
 numpy
 shapely
+scipy
 ultralytics
 inference-sdk
 python-multipart

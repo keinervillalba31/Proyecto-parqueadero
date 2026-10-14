@@ -4,6 +4,7 @@ import itertools
 import os
 import re
 import tempfile
+import threading
 import time
 from collections import Counter, deque
 from importlib import import_module
@@ -100,6 +101,8 @@ class PlateReader:
         self.reads: deque[str] = deque(maxlen=12)
         # placa confirmada -> momento hasta el que no se vuelve a confirmar.
         self.cooldowns: dict[str, float] = {}
+        # El hilo de lectura y el que consulta al backend tocan lecturas y esperas.
+        self._lock = threading.RLock()
         self._cached_client: Any = None
 
     @staticmethod
@@ -229,34 +232,45 @@ class PlateReader:
         como la misma placa, y se publica la versión más repetida. Las
         lecturas de otros vehículos se conservan para seguir confirmándolos.
         """
-        if self.in_cooldown(plate):
-            return None
-        self.reads.append(plate)
-        group = [read for read in self.reads if similar(read, plate)]
-        if len(group) < self.confirmation_reads:
-            return None
+        with self._lock:
+            if self.in_cooldown(plate):
+                return None
+            self.reads.append(plate)
+            group = [read for read in self.reads if similar(read, plate)]
+            if len(group) < self.confirmation_reads:
+                return None
 
-        # La más repetida; en empate, la que se parece a más lecturas del grupo
-        # (entre BRF50, RF509 y BRF509 se elige BRF509).
-        counts = Counter(group)
-        confirmed = max(
-            counts,
-            key=lambda read: (counts[read], sum(similar(read, other) for other in group)),
-        )
+            # La más repetida; en empate, la que se parece a más lecturas del grupo
+            # (entre BRF50, RF509 y BRF509 se elige BRF509).
+            counts = Counter(group)
+            confirmed = max(
+                counts,
+                key=lambda read: (counts[read], sum(similar(read, other) for other in group)),
+            )
+            self._forget(plate)
+            return confirmed, len(group)
+
+    def _forget(self, plate: str) -> None:
         self.reads = deque(
             (read for read in self.reads if not similar(read, plate)),
             maxlen=self.reads.maxlen,
         )
-        return confirmed, len(group)
 
     def reset(self) -> None:
         self.reads.clear()
 
     def in_cooldown(self, plate: str) -> bool:
         """True si esta placa (o una casi igual) se confirmó hace poco."""
-        now = time.monotonic()
-        self.cooldowns = {p: until for p, until in self.cooldowns.items() if until > now}
-        return any(similar(plate, recent) for recent in self.cooldowns)
+        with self._lock:
+            now = time.monotonic()
+            self.cooldowns = {p: until for p, until in self.cooldowns.items() if until > now}
+            return any(similar(plate, recent) for recent in self.cooldowns)
 
-    def start_cooldown(self, plate: str) -> None:
-        self.cooldowns[plate] = time.monotonic() + self.cooldown_seconds
+    def start_cooldown(self, plate: str, seconds: float | None = None) -> None:
+        """No volver a confirmar esta placa durante `seconds` (por defecto, cooldown_seconds)."""
+        # También descarta sus lecturas pendientes: si el backend la reconoció en la
+        # primera lectura, esa lectura no debe contar para otra confirmación después.
+        with self._lock:
+            wait = self.cooldown_seconds if seconds is None else seconds
+            self.cooldowns[plate] = time.monotonic() + wait
+            self._forget(plate)

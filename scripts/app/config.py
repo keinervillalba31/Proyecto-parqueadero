@@ -62,6 +62,9 @@ class Settings:
     plate_interval_frames: int = int(os.getenv("PLATE_INTERVAL_FRAMES", "15"))
     plate_confirmation_reads: int = int(os.getenv("PLATE_CONFIRMATION_READS", "2"))
     plate_cooldown_seconds: float = float(os.getenv("PLATE_COOLDOWN_SECONDS", "30"))
+    # Espera corta cuando el backend respondió "por ahora no aplica" (el estudiante ya
+    # tiene puesto, no hay cupo...): eso puede cambiar en segundos, así que se vuelve a consultar pronto.
+    plate_recheck_seconds: float = float(os.getenv("PLATE_RECHECK_SECONDS", "4"))
     plate_require_vehicle: bool = os.getenv("PLATE_REQUIRE_VEHICLE", "true").lower() == "true"
     # Vacío = acepta cualquier texto. Por defecto, placas colombianas.
     plate_pattern: str = os.getenv("PLATE_PATTERN", DEFAULT_PLATE_PATTERN)
@@ -76,6 +79,8 @@ class Settings:
     video_camera_retry_seconds: float = float(os.getenv("VIDEO_CAMERA_RETRY_SECONDS", "10"))
     service_host: str = os.getenv("SERVICE_HOST", "0.0.0.0")
     service_port: int = int(os.getenv("SERVICE_PORT", "8000"))
+    # Dónde se guarda lo que el operador dejó encendido o apagado desde el panel.
+    services_state_path: Path = project_path("SERVICES_STATE", PROJECT_DIR / "servicios_activos.json")
     roboflow_workspace: str = os.getenv("ROBOFLOW_WORKSPACE", "")
     roboflow_workflow: str = os.getenv("ROBOFLOW_WORKFLOW", "")
 
@@ -99,6 +104,8 @@ class Settings:
         int(os.getenv("BACKEND_CAMERA_ID")) if os.getenv("BACKEND_CAMERA_ID") else None
     )
     backend_cells_poll_seconds: float = float(os.getenv("BACKEND_CELLS_POLL_SECONDS", "15"))
+    # Cada cuánto se consulta qué encendió o apagó el operador en la plataforma (espacios, placas).
+    backend_services_poll_seconds: float = float(os.getenv("BACKEND_SERVICES_POLL_SECONDS", "3"))
     # Cada cuánto se revisa si cambió la ocupación de las celdas para enviarla al backend.
     # Aunque no cambie, se reenvía cada BACKEND_OCCUPANCY_RESEND_SECONDS por si el backend
     # se reinició o alguien cambió un puesto a mano.

@@ -82,6 +82,26 @@ python run_service.py
 
 (El comando anterior, `python -m uvicorn api_video:app --app-dir scripts ...`, sigue funcionando.)
 
+**Sin comandos: el panel.** Doble clic en `Abrir panel.bat`: enciende el servicio si no lo
+estaba (sin consola) y abre el panel en el navegador, `http://localhost:8000/`. Desde otro
+equipo de la red se entra con `http://<este-servidor>:8000/`. El panel muestra el video, las
+celdas y la última placa, y tiene un interruptor para cada cosa:
+
+- **Espacios**: detección de celdas libres y ocupadas. Apagado, se conservan los últimos
+  datos y deja de enviarse la ocupación al backend.
+- **Placas**: lectura de placas. Apagado, no se hacen consultas a Roboflow.
+
+**Desde la plataforma.** Con `BACKEND_SYNC_ENABLED=true`, los mismos dos interruptores están
+en la página **Monitoreo** (los puede mover quien tenga el permiso `MONITORING_MANAGE`). El
+servicio consulta `GET /api/monitoring/services` cada `BACKEND_SERVICES_POLL_SECONDS` y obedece
+lo que diga la plataforma; un cambio hecho en el panel local se guarda también allá, así que
+los dos siempre muestran lo mismo.
+
+El video se sigue transmitiendo aunque los dos estén apagados. Lo que se deja encendido o
+apagado se guarda en `servicios_activos.json` y se respeta al reiniciar. Cuando el servicio
+arranca sin consola, sus mensajes quedan en `servicio.log`. El panel no pide usuario, igual
+que el resto de la API: cualquiera que alcance el puerto puede usar los interruptores.
+
 **Cámara con video de respaldo.** Pon la cámara en `VIDEO_SOURCE` (por ejemplo
 `rtsp://usuario:clave@192.168.1.20/stream`) y un video corto en `VIDEO_FALLBACK`.
 Si la cámara no responde, el servicio reproduce ese video en bucle sin parar y
@@ -152,6 +172,9 @@ Las pruebas simulan YOLO, así que no necesitan GPU ni video.
 
 ## Endpoints
 
+- `GET /`: panel del operador.
+- `GET /servicios`: qué está encendido (`espacios`, `placas`). `POST /servicios` con
+  `{"espacios": true|false, "placas": true|false}` lo cambia; lo que no se envía no cambia.
 - `GET /snapshot`: cuadro actual sin dibujos (la plataforma lo usa para trazar celdas).
 - `GET /video/parqueadero` (`/video`): video en vivo del parqueadero.
 - `GET /video/placas`: video en vivo de la fuente independiente de placas (`PLATE_VIDEO_SOURCE`).
@@ -184,15 +207,30 @@ Las pruebas simulan YOLO, así que no necesitan GPU ni video.
 
 ## Sincronización con el backend
 
-Además de la reserva local (en memoria, para la vista en vivo), el servicio puede
-pedirle a `educore-backend` que haga y guarde la asignación real:
+Además de la reserva local (en memoria, para la vista en vivo), el servicio le
+avisa a `educore-backend` de cada placa confirmada:
 
 1. Se autentica como una cuenta de servicio (un usuario con rol **Operador**, que
    ya tiene los permisos `ASSIGNMENTS_MANAGE` y `PLATES_VIEW`).
-2. Con la placa confirmada, busca el vehículo (`GET /api/vehicles/plate/{placa}`).
-3. Si el vehículo está activo, busca el id del estudiante dueño por su código
-   (`GET /api/assignments/students`).
-4. Le pide al backend el espacio y lo guarda (`POST /api/assignments/auto`).
+2. Envía la placa (`POST /api/assignments/plate-entry`) desde la **primera lectura**, en un
+   hilo aparte: si el backend la reconoce como de un estudiante, eso ya la confirma y no se
+   espera a repetir la lectura. Si no la conoce, se sigue confirmando con
+   `PLATE_CONFIRMATION_READS` lecturas parecidas; y si dos lecturas casi iguales se
+   confirman entre sí (ABC128 y ABC123), el backend decide cuál es la real.
+3. Si es de un estudiante activo sin puesto, el backend le manda un aviso y la
+   plataforma le abre el formulario de **Mi parqueadero**: él elige parqueadero,
+   cuántas horas estará y el puesto. El puesto se asigna cuando confirma, no antes.
+   Mientras no responda, el aviso no se repite durante 3 minutos aunque la placa se
+   vuelva a leer; si ya tuvo puesto y lo liberó, la siguiente lectura le avisa de inmediato.
+4. Solo si el estudiante no tiene usuario en la plataforma se le asigna un puesto
+   libre al azar por el tiempo máximo, como antes.
+
+**Plano para el mapa 3D.** Con las celdas de la plataforma, el servicio calcula el plano de
+planta del parqueadero (`scripts/app/parking_layout.py`): endereza la vista diagonal de la
+cámara y deja cada puesto como un rectángulo en metros. Lo envía con
+`PUT /api/monitoring/cameras/{id}/layout` cada vez que cambia el trazado, y la plataforma lo
+usa para mostrarle al estudiante su puesto en 3D. En `prototipos/` está la versión suelta de
+esa escena, para probar cambios de apariencia sin levantar la plataforma.
 
 Esto corre en un hilo aparte (`backend-sync`): si el backend no responde o la
 placa no está registrada allá, el video y la lectura de placas siguen igual —

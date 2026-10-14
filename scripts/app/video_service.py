@@ -10,9 +10,10 @@ from typing import Any
 import cv2
 import numpy as np
 
-from .backend_client import BackendClient, BackendError
+from .backend_client import BackendClient, BackendError, PlateEntryResult
 from .config import Settings
 from .parking_detector import ParkingDetector, VehicleDetector
+from .parking_layout import build_layout
 from .plate_reader import PlateReader, vehicle_crops
 from .state import RuntimeState
 
@@ -20,6 +21,12 @@ log = logging.getLogger("parqueadero")
 
 
 class VideoService:
+    # Lo que el operador enciende o apaga desde el panel. El video sigue
+    # transmitiéndose aunque los dos estén apagados.
+    spaces_enabled = True
+    plates_enabled = True
+    backend: BackendClient | None = None
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.backend = BackendClient(settings) if settings.backend_sync_enabled else None
@@ -41,6 +48,12 @@ class VideoService:
             plate_pattern=settings.plate_pattern,
         )
         self.state = RuntimeState(self.parking.total_spaces)
+        self.spaces_enabled, self.plates_enabled = self._load_services(
+            settings.services_state_path
+        )
+        self.state.update_services(self.services())
+        if not self.plates_enabled:
+            self.state.update_plate({"estado": "detenido"})
         self.registered_vehicles = self._load_registered_vehicles(
             settings.registered_vehicles_path
         )
@@ -49,6 +62,8 @@ class VideoService:
         self.reservations: dict[str, dict[str, Any]] = {}
         self.reservations_lock = threading.Lock()
         self.plate_thread: threading.Thread | None = None
+        # placa -> hasta cuándo no se vuelve a consultar al backend por su primera lectura.
+        self.first_read_checks: dict[str, float] = {}
         self.vehicle_was_detected = False
         self.frame_number = 0
         self.thread: threading.Thread | None = None
@@ -67,7 +82,11 @@ class VideoService:
         self.plate_vehicle_detector: VehicleDetector | None = None
         self.cells_thread: threading.Thread | None = None
         self.cells_version: str | None = None
+        # Celdas de la plataforma (relativas) y para cuáles ya se envió el plano de planta.
+        self.platform_cells: dict[str, dict[str, Any]] = {}
+        self.layout_reported_for: tuple[str | None, int, int] | None = None
         self.occupancy_thread: threading.Thread | None = None
+        self.services_thread: threading.Thread | None = None
         # Última ocupación que aceptó el backend (puesto_id -> ocupado) y cuándo.
         self.reported_occupancy: dict[int, bool] | None = None
         self.reported_at = 0.0
@@ -91,10 +110,96 @@ class VideoService:
         with path.open("r", encoding="utf-8") as file:
             return json.load(file)
 
+    @staticmethod
+    def _load_services(path: Path) -> tuple[bool, bool]:
+        """Lo que quedó encendido la última vez; sin archivo, todo encendido."""
+        try:
+            with path.open("r", encoding="utf-8") as file:
+                saved = json.load(file)
+            return bool(saved.get("espacios", True)), bool(saved.get("placas", True))
+        except (OSError, ValueError, AttributeError):
+            return True, True
+
+    def services(self) -> dict[str, bool]:
+        return {"espacios": self.spaces_enabled, "placas": self.plates_enabled}
+
+    def set_services(
+        self, spaces: bool | None = None, plates: bool | None = None
+    ) -> dict[str, bool]:
+        """Cambio pedido desde el panel local (None = no cambiar).
+
+        Con el backend activo manda lo que diga la plataforma, así que el cambio
+        se guarda primero allá; si no, la siguiente consulta lo desharía.
+        """
+        if self.backend:
+            try:
+                self.backend.set_services(spaces, plates)
+            except BackendError as error:
+                log.warning("No se pudo guardar el cambio de servicios en la plataforma: %s", error)
+        return self._apply_services(spaces, plates)
+
+    def _apply_services(
+        self, spaces: bool | None = None, plates: bool | None = None
+    ) -> dict[str, bool]:
+        """Enciende o apaga la detección de espacios y la lectura de placas (None = no cambiar).
+
+        Se guarda en disco para que un reinicio del servicio respete lo que dejó el operador.
+        """
+        if (spaces is None or spaces == self.spaces_enabled) and (
+            plates is None or plates == self.plates_enabled
+        ):
+            return self.services()
+        if spaces is not None:
+            self.spaces_enabled = spaces
+        if plates is not None and plates != self.plates_enabled:
+            self.plates_enabled = plates
+            self.state.update_plate({"estado": "esperando" if plates else "detenido"})
+        current = self.services()
+        self.state.update_services(current)
+        log.info(
+            "Servicios: espacios %s, placas %s",
+            "encendido" if current["espacios"] else "apagado",
+            "encendido" if current["placas"] else "apagado",
+        )
+        try:
+            self.settings.services_state_path.write_text(json.dumps(current), encoding="utf-8")
+        except OSError as error:
+            log.warning("No se pudo guardar el estado de los servicios: %s", error)
+        return current
+
+    def _services_loop(self) -> None:
+        """Obedece los interruptores de la plataforma (Monitoreo > Servicios de detección)."""
+        failing = False
+        while self.running:
+            try:
+                wanted = self.backend.get_services()
+            except BackendError as error:
+                if not failing:
+                    log.warning("No se pudieron consultar los servicios en la plataforma: %s", error)
+                failing = True
+            else:
+                failing = False
+                self._apply_services(wanted["espacios"], wanted["placas"])
+            waited = 0.0
+            while self.running and waited < self.settings.backend_services_poll_seconds:
+                time.sleep(0.5)
+                waited += 0.5
+
+    def _detection_needed(self) -> bool:
+        """YOLO corre para los espacios, o para las placas si comparten la cámara del parqueadero."""
+        return self.spaces_enabled or (
+            self.plates_enabled and not self.settings.plate_video_source
+        )
+
     def start(self) -> None:
         if self.running:
             return
         self.running = True
+        if self.backend:
+            self.services_thread = threading.Thread(
+                target=self._services_loop, name="services-sync", daemon=True
+            )
+            self.services_thread.start()
         if self.backend and self.settings.backend_camera_id is not None:
             self.cells_thread = threading.Thread(target=self._cells_loop, name="cells-sync", daemon=True)
             self.cells_thread.start()
@@ -122,6 +227,7 @@ class VideoService:
             self.plate_video_thread,
             self.cells_thread,
             self.occupancy_thread,
+            self.services_thread,
         ):
             if worker and worker is not threading.current_thread():
                 worker.join(timeout=2)
@@ -272,10 +378,54 @@ class VideoService:
             skip_parked=self.settings.plate_skip_parked,
         )
 
-    def _publish_confirmed(self, plate: str, read_count: int, last_read: str) -> None:
+    def _check_first_read(self, plate: str) -> threading.Thread | None:
+        """Primera lectura de una placa: se le pregunta de una vez al backend si la conoce.
+
+        Si es de un estudiante, eso ya la confirma y no se espera a repetir la
+        lectura (que es lo que más demora). Corre en su propio hilo para no
+        frenar la lectura; si el backend no la conoce, la confirmación por
+        lecturas repetidas sigue su curso. Cada placa se consulta una sola vez
+        por PLATE_COOLDOWN_SECONDS.
+        """
+        if not self.backend or self.plates.in_cooldown(plate):
+            return None
+        now = time.monotonic()
+        self.first_read_checks = {
+            read: until for read, until in self.first_read_checks.items() if until > now
+        }
+        if plate in self.first_read_checks:
+            return None
+        self.first_read_checks[plate] = now + self.settings.plate_cooldown_seconds
+        worker = threading.Thread(
+            target=self._sync_first_read, args=(plate,), name="backend-first-read", daemon=True
+        )
+        worker.start()
+        return worker
+
+    def _sync_first_read(self, plate: str) -> None:
+        try:
+            result = self.backend.sync_plate_detection(plate)
+        except BackendError as error:
+            log.warning("No se pudo consultar la placa %s en el backend: %s", plate, error)
+            return
+        if result.outcome == "NOT_REGISTERED":
+            return
+        log.info("Placa %s reconocida por el backend en la primera lectura (%s)", plate, result.outcome)
+        self._publish_confirmed(plate, 1, last_read=plate, backend_result=result)
+
+    def _publish_confirmed(
+        self,
+        plate: str,
+        read_count: int,
+        last_read: str,
+        backend_result: PlateEntryResult | None = None,
+    ) -> None:
         registered = plate in self.registered_vehicles
+        # Con los espacios apagados la ocupación está desactualizada: no se reserva celda local.
         assigned_space = (
-            self._assign_space(plate, self.state.snapshot()) if registered else None
+            self._assign_space(plate, self.state.snapshot())
+            if registered and self.spaces_enabled
+            else None
         )
         self.state.update_plate(
             {
@@ -292,25 +442,55 @@ class VideoService:
             replace=True,
         )
         self.plates.start_cooldown(plate)
-        if self.backend:
+        if backend_result is not None:
+            # El backend ya respondió (primera lectura): no hace falta volver a enviarla.
+            self._apply_backend_result(backend_result)
+            self._recheck_soon_if_pending(plate, backend_result)
+        elif self.backend:
             threading.Thread(
-                target=self._sync_with_backend, args=(plate,), name="backend-sync", daemon=True
+                target=self._sync_with_backend,
+                args=(plate, last_read),
+                name="backend-sync",
+                daemon=True,
             ).start()
 
-    def _sync_with_backend(self, plate: str) -> None:
-        """Le pide al backend que asigne y guarde el puesto para esta placa.
+    def _sync_with_backend(self, plate: str, other_read: str | None = None) -> None:
+        """Le avisa al backend de la placa confirmada.
 
         Corre en su propio hilo: una falla de red o un rechazo del backend
         nunca debe detener la detección de video ni el reconocimiento de placas.
         """
         try:
             result = self.backend.sync_plate_detection(plate)
+            if result.outcome == "NOT_REGISTERED" and other_read and other_read != plate:
+                # Dos lecturas casi iguales (ABC128 y ABC123) se confirmaron entre sí:
+                # si el backend no conoce la elegida pero sí la otra, la otra es la real.
+                other = self.backend.sync_plate_detection(other_read)
+                if other.outcome != "NOT_REGISTERED":
+                    self.state.update_plate({"valor": other_read})
+                    result = other
         except BackendError as error:
             self.state.update_plate({"backend_estado": "error", "backend_error": str(error)})
             return
+        self._apply_backend_result(result)
+        self._recheck_soon_if_pending(result.plate, result)
 
+    def _recheck_soon_if_pending(self, plate: str, result: PlateEntryResult) -> None:
+        """Acorta la espera cuando el backend conoce la placa pero aún no hizo nada con ella.
+
+        "Ya tiene puesto" o "no hay cupo" pueden cambiar en segundos (libera el
+        puesto, se desocupa una celda); esperar PLATE_COOLDOWN_SECONDS completos
+        dejaría al estudiante medio minuto sin su aviso. Cuando ya se le avisó o
+        se le asignó, la espera larga sí aplica.
+        """
+        if result.outcome in ("PROMPTED", "ASSIGNED", "NOT_REGISTERED"):
+            return
+        wait = self.settings.plate_recheck_seconds
+        self.plates.start_cooldown(plate, wait)
+        self.first_read_checks[plate] = time.monotonic() + wait
+    def _apply_backend_result(self, result: PlateEntryResult) -> None:
         if not result.assigned:
-            # Placa no registrada, estudiante con puesto activo o sin cupo: se ignora.
+            # Se le avisó al estudiante, o no aplica (no registrada, ya tiene puesto...).
             self.state.update_plate(
                 {"backend_estado": result.outcome.lower(), "backend_error": None}
             )
@@ -332,7 +512,18 @@ class VideoService:
             self.state.update_plate(
                 {"ultimo_intento": time.time(), "error": None, "estado": "leyendo"}
             )
+            started = time.perf_counter()
             plates = [plate for image in images for plate in self.plates.read_all(image)]
+            log.info(
+                "Lectura de placas: %d imagen(es) en %.1f s -> %s",
+                len(images),
+                time.perf_counter() - started,
+                ", ".join(plates) or "nada",
+            )
+            if not self.plates_enabled:
+                # Se apagó mientras se leía: el resultado se descarta.
+                self.state.update_plate({"estado": "detenido"})
+                return
             if not plates:
                 self.state.update_plate({"estado": "sin_lectura"})
                 return
@@ -343,6 +534,8 @@ class VideoService:
                 if confirmed:
                     self._publish_confirmed(*confirmed, last_read=plate)
                     confirmed_any = True
+                else:
+                    self._check_first_read(plate)
 
             if not confirmed_any:
                 self.state.update_plate(
@@ -382,14 +575,45 @@ class VideoService:
             return False
 
         self.parking.set_relative_cells(cells)
+        self.platform_cells = cells
         self.state.update_source({"celdas_origen": "plataforma", "celdas_version": version})
         log.info("Celdas actualizadas desde la plataforma: %d (versión %s)", len(cells), version)
+        return True
+
+    def _report_layout(self) -> bool:
+        """Calcula el plano de planta de las celdas y lo envía al backend. True si se envió.
+
+        Es lo que usa la plataforma para mostrarle al estudiante su puesto en el
+        mapa 3D. Solo se recalcula cuando cambian las celdas o el tamaño del video.
+        """
+        with self.frame_lock:
+            frame = self.latest_frame
+        if frame is None or not self.platform_cells:
+            return False
+        height, width = frame.shape[:2]
+        key = (self.cells_version, width, height)
+        if key == self.layout_reported_for:
+            return False
+        try:
+            layout = build_layout(self.platform_cells, width, height)
+        except ValueError as error:
+            log.warning("No se pudo calcular el plano del parqueadero: %s", error)
+            self.layout_reported_for = key        # no se reintenta hasta que cambien las celdas
+            return False
+        try:
+            self.backend.report_layout(self.settings.backend_camera_id, self.cells_version or "", layout)
+        except BackendError as error:
+            log.warning("No se pudo enviar el plano del parqueadero al backend: %s", error)
+            return False
+        self.layout_reported_for = key
+        log.info("Plano del parqueadero enviado al backend: %d puestos", len(layout))
         return True
 
     def _cells_loop(self) -> None:
         """Revisa cada cierto tiempo si el administrador cambió las celdas."""
         while self.running:
             self._refresh_cells()
+            self._report_layout()
             waited = 0.0
             while self.running and waited < self.settings.backend_cells_poll_seconds:
                 time.sleep(0.5)
@@ -401,6 +625,8 @@ class VideoService:
         Solo se envía cuando cambia algo, o cada BACKEND_OCCUPANCY_RESEND_SECONDS
         para corregir el backend si se reinició o alguien cambió un puesto a mano.
         """
+        if not self.spaces_enabled:
+            return False
         cells = self.state.snapshot().get("celdas", {})
         occupancy = {
             cell["puesto_id"]: bool(cell.get("ocupado"))
@@ -495,7 +721,10 @@ class VideoService:
                 model_path=self.settings.model_path,
                 confidence=self.settings.yolo_confidence,
                 image_size=self.settings.yolo_image_size,
-                tile_grid=self.settings.yolo_tile_grid,
+                # Sin recortes: en la cámara de placas el vehículo está cerca y se ve
+                # grande; los recortes son para los lejanos del parqueadero y aquí
+                # solo multiplicarían por cinco el tiempo de cada intento.
+                tile_grid=1,
                 minimum_box_area=self.settings.minimum_box_area,
                 minimum_motorcycle_area=self.settings.minimum_motorcycle_area,
             )
@@ -559,7 +788,8 @@ class VideoService:
                 self._publish_plate_frame(frame)
                 frame_number += 1
                 if (
-                    frame_number % max(self.settings.plate_interval_frames, 1) == 0
+                    self.plates_enabled
+                    and frame_number % max(self.settings.plate_interval_frames, 1) == 0
                     and (self.plate_thread is None or not self.plate_thread.is_alive())
                 ):
                     self.plate_thread = threading.Thread(
@@ -641,6 +871,9 @@ class VideoService:
         """
         last_id = 0
         while self.running:
+            if not self._detection_needed():
+                time.sleep(0.2)
+                continue
             with self.frame_lock:
                 frame, frame_id = self.latest_frame, self.latest_frame_id
             if frame is None or frame_id == last_id:
@@ -664,7 +897,7 @@ class VideoService:
             self.overlay = (vehicles, parking_state, reserved)
 
         vehicle_detected = parking_state["vehiculos_detectados"] > 0
-        if not self.settings.plate_video_source and self._plate_attempt_allowed(vehicle_detected) and (
+        if self.plates_enabled and not self.settings.plate_video_source and self._plate_attempt_allowed(vehicle_detected) and (
             self.plate_thread is None or not self.plate_thread.is_alive()
         ):
             images = self._plate_images(frame)
@@ -675,7 +908,8 @@ class VideoService:
                 self.plate_thread.start()
         self.vehicle_was_detected = vehicle_detected
 
-        self.state.update(parking_state)
+        if self.spaces_enabled:
+            self.state.update(parking_state)
         if self.detector_failed:
             self.detector_failed = False
             self.state.worker_error = None

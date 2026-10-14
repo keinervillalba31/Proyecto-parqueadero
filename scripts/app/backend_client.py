@@ -10,6 +10,9 @@ import requests
 from .config import Settings
 
 
+RELOGIN_ON_403_SECONDS = 60
+
+
 class BackendError(RuntimeError):
     """Cualquier falla al hablar con educore-backend (red, login, datos)."""
 
@@ -28,8 +31,10 @@ class AssignmentResult:
 class PlateEntryResult:
     """Respuesta de POST /api/assignments/plate-entry.
 
-    outcome: ASSIGNED, NOT_REGISTERED, STUDENT_INACTIVE, ALREADY_ASSIGNED o NO_SPACE.
-    Solo ASSIGNED trae los datos del puesto; los demás casos se ignoran.
+    outcome: PROMPTED (se le avisó al estudiante para que elija tiempo y puesto en la
+    plataforma), ALREADY_PROMPTED, ASSIGNED, NOT_REGISTERED, STUDENT_INACTIVE,
+    ALREADY_ASSIGNED, NO_SPACE o NO_LIVE_DATA. Solo ASSIGNED (estudiante sin usuario en
+    la plataforma) trae los datos del puesto; los demás casos solo se informan.
     """
 
     outcome: str
@@ -63,6 +68,7 @@ class BackendClient:
         # cruzan, el POST sale con un token viejo y el backend responde 403.
         self._lock = threading.RLock()
         self._logged_in = False
+        self._logged_in_at = float("-inf")
         self._students_cache: list[dict[str, Any]] = []
         self._students_cache_at: float = 0.0
 
@@ -106,6 +112,7 @@ class BackendClient:
                 f"Login contra el backend falló ({response.status_code}): {response.text[:200]}"
             )
         self._logged_in = True
+        self._logged_in_at = time.monotonic()
 
     def _ensure_login(self) -> None:
         if not self._logged_in:
@@ -124,7 +131,7 @@ class BackendClient:
         except requests.RequestException as error:
             raise BackendError(f"Error de red llamando a {path}: {error}") from error
 
-        if response.status_code == 401 and retry:
+        if retry and self._session_expired(response.status_code):
             # La sesión expiró: se reintenta una sola vez con un login nuevo.
             self._logged_in = False
             self.login()
@@ -134,6 +141,17 @@ class BackendClient:
                 kwargs["headers"] = {**headers, "X-XSRF-TOKEN": self._csrf_token() or ""}
             return self._request(method, path, retry=False, **kwargs)
         return response
+
+    def _session_expired(self, status_code: int) -> bool:
+        """El backend responde 403 (no 401) cuando el JWT vence, al cabo de una hora.
+
+        Un 403 también puede ser falta de permisos, así que solo se toma como
+        sesión vencida si el último login no es reciente: de lo contrario se
+        haría un login nuevo en cada petición rechazada.
+        """
+        if status_code == 401:
+            return True
+        return status_code == 403 and time.monotonic() - self._logged_in_at > RELOGIN_ON_403_SECONDS
 
     def _mutating_request(self, method: str, path: str, *, json: dict[str, Any]) -> requests.Response:
         # El backend invalida la cookie XSRF-TOKEN en cuanto se hace una
@@ -194,6 +212,50 @@ class BackendClient:
             )
         return response.json().get("data", {})
 
+    def report_layout(self, camera_id: int, version: str, cells: list[dict[str, Any]]) -> None:
+        """Envía el plano de planta de los puestos de esta cámara (para el mapa 3D del estudiante)."""
+        response = self._mutating_request(
+            "PUT",
+            f"/api/monitoring/cameras/{camera_id}/layout",
+            json={"version": version, "cells": cells},
+        )
+        if response.status_code != 200:
+            raise BackendError(
+                f"El backend rechazó el plano de la cámara {camera_id} "
+                f"({response.status_code}): {response.text[:200]}"
+            )
+
+    @staticmethod
+    def _services_from(response: requests.Response) -> dict[str, bool]:
+        data = response.json().get("data") or {}
+        return {
+            "espacios": bool(data.get("spacesEnabled", True)),
+            "placas": bool(data.get("platesEnabled", True)),
+        }
+
+    def get_services(self) -> dict[str, bool]:
+        """Qué dejó encendido el operador en la plataforma (Monitoreo)."""
+        response = self._request("GET", "/api/monitoring/services")
+        if response.status_code != 200:
+            raise BackendError(
+                f"No se pudieron consultar los servicios de detección "
+                f"({response.status_code}): {response.text[:200]}"
+            )
+        return self._services_from(response)
+
+    def set_services(self, spaces: bool | None, plates: bool | None) -> dict[str, bool]:
+        """Guarda en la plataforma un cambio hecho desde el panel local (None = no cambiar)."""
+        response = self._mutating_request(
+            "PATCH",
+            "/api/monitoring/services",
+            json={"spacesEnabled": spaces, "platesEnabled": plates},
+        )
+        if response.status_code != 200:
+            raise BackendError(
+                f"El backend rechazó el cambio de servicios ({response.status_code}): {response.text[:200]}"
+            )
+        return self._services_from(response)
+
     def list_students(self, force_refresh: bool = False) -> list[dict[str, Any]]:
         age = time.monotonic() - self._students_cache_at
         if not force_refresh and self._students_cache and age < self.settings.backend_students_cache_seconds:
@@ -243,9 +305,9 @@ class BackendClient:
     def register_plate_entry(self, plate: str, parking_id: int | None = None) -> PlateEntryResult:
         """Le pasa al backend la placa leída en la entrada.
 
-        El backend valida el vehículo, evita asignar dos veces al mismo
-        estudiante, elige un puesto libre al azar y le envía el ticket
-        (notificación) al estudiante, todo en una sola transacción.
+        El backend valida el vehículo y le avisa al estudiante para que él
+        elija parqueadero, tiempo y puesto en la plataforma. Si el estudiante
+        no tiene usuario allá, le asigna un puesto libre al azar.
         """
         response = self._mutating_request(
             "POST",
