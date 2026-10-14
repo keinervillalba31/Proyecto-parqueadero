@@ -91,8 +91,10 @@ class PlateReader:
         confirmation_reads: int,
         cooldown_seconds: float,
         plate_pattern: str = DEFAULT_PLATE_PATTERN,
+        request_timeout: float = 30.0,
     ) -> None:
         self.workspace = workspace
+        self.request_timeout = request_timeout
         self.workflow = workflow
         self.confirmation_reads = confirmation_reads
         self.cooldown_seconds = cooldown_seconds
@@ -207,16 +209,42 @@ class PlateReader:
                 temporary.write(encoded.tobytes())
                 temporary_path = temporary.name
 
-            result = self._client().run_workflow(
-                workspace_name=self.workspace,
-                workflow_id=self.workflow,
-                images={"image": temporary_path},
-                use_cache=True,
-            )
+            result = self._run_workflow(temporary_path)
             return self.extract_texts(result)
         finally:
             if temporary_path:
                 Path(temporary_path).unlink(missing_ok=True)
+
+    def _run_workflow(self, image_path: str) -> Any:
+        """Llama a Roboflow con un tiempo máximo.
+
+        inference_sdk no le pone tiempo máximo a la petición: si Roboflow no
+        responde, la llamada se queda esperando para siempre y, como solo hay una
+        lectura a la vez, la lectura de placas se detiene sin dar error. Aquí la
+        llamada corre en un hilo aparte; si no termina a tiempo se abandona (el
+        hilo muere solo cuando la conexión se cierre) y se sigue con el siguiente intento.
+        """
+        outcome: dict[str, Any] = {}
+
+        def call() -> None:
+            try:
+                outcome["result"] = self._client().run_workflow(
+                    workspace_name=self.workspace,
+                    workflow_id=self.workflow,
+                    images={"image": image_path},
+                    use_cache=True,
+                )
+            except BaseException as error:  # se relanza en el hilo que espera
+                outcome["error"] = error
+
+        worker = threading.Thread(target=call, name="roboflow-request", daemon=True)
+        worker.start()
+        worker.join(self.request_timeout)
+        if worker.is_alive():
+            raise TimeoutError(f"Roboflow no respondió en {self.request_timeout:.0f} s")
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["result"]
 
     def read_all(self, frame: np.ndarray) -> list[str]:
         return self.valid_plates(self.read_texts(frame))

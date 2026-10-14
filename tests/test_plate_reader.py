@@ -1,4 +1,8 @@
+import threading
+import time
+
 import numpy as np
+import pytest
 
 from app.parking_detector import Vehicle
 from app.plate_reader import PlateReader, edit_distance, vehicle_crops
@@ -6,6 +10,34 @@ from app.plate_reader import PlateReader, edit_distance, vehicle_crops
 
 def make_reader(confirmation_reads: int = 2, **kwargs) -> PlateReader:
     return PlateReader("workspace", "workflow", confirmation_reads, cooldown_seconds=30, **kwargs)
+
+
+class FakeClient:
+    def __init__(self, result=None, block: threading.Event | None = None) -> None:
+        self.result, self.block = result, block
+
+    def run_workflow(self, **kwargs):
+        if self.block is not None:
+            self.block.wait()
+        return self.result
+
+
+def test_read_gives_up_when_roboflow_does_not_answer():
+    # Una petición colgada no puede detener la lectura de placas para siempre.
+    reader = make_reader(request_timeout=0.2)
+    hanging = threading.Event()
+    reader._cached_client = FakeClient(block=hanging)
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        reader.read_all(np.zeros((40, 40, 3), dtype=np.uint8))
+    assert time.monotonic() - started < 2
+    hanging.set()
+
+
+def test_read_returns_plates_when_roboflow_answers_in_time():
+    reader = make_reader(request_timeout=5)
+    reader._cached_client = FakeClient(result=[{"plate_text": ["ABC123"]}])
+    assert reader.read_all(np.zeros((40, 40, 3), dtype=np.uint8)) == ["ABC123"]
 
 
 def test_normalize_removes_spaces_and_symbols():

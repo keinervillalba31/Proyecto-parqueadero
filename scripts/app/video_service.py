@@ -46,6 +46,7 @@ class VideoService:
             confirmation_reads=settings.plate_confirmation_reads,
             cooldown_seconds=settings.plate_cooldown_seconds,
             plate_pattern=settings.plate_pattern,
+            request_timeout=settings.plate_ocr_timeout_seconds,
         )
         self.state = RuntimeState(self.parking.total_spaces)
         self.spaces_enabled, self.plates_enabled = self._load_services(
@@ -546,6 +547,7 @@ class VideoService:
                     }
                 )
         except Exception as error:
+            log.warning("Falló la lectura de placas: %s", error)
             self.state.update_plate({"estado": "error_lectura", "error": str(error)})
 
     def _refresh_cells(self) -> bool:
