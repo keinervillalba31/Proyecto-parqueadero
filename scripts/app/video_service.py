@@ -919,10 +919,13 @@ class VideoService:
         self.analysis_seconds = seconds if not self.analysis_seconds else 0.8 * self.analysis_seconds + 0.2 * seconds
         self.state.update_performance({"fps_analisis": round(1 / self.analysis_seconds, 1)})
 
-    def snapshot_jpeg(self) -> bytes | None:
+    def clean_frame(self) -> np.ndarray | None:
         """El cuadro más reciente tal como lo entrega la fuente, sin cajas ni celdas dibujadas."""
         with self.frame_lock:
-            frame = self.latest_frame
+            return self.latest_frame
+
+    def snapshot_jpeg(self) -> bytes | None:
+        frame = self.clean_frame()
         if frame is None:
             return None
         ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
