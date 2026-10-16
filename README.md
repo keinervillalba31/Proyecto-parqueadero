@@ -176,6 +176,9 @@ Las pruebas simulan YOLO, así que no necesitan GPU ni video.
 - `GET /servicios`: qué está encendido (`espacios`, `placas`). `POST /servicios` con
   `{"espacios": true|false, "placas": true|false}` lo cambia; lo que no se envía no cambia.
 - `GET /snapshot`: cuadro actual sin dibujos (la plataforma lo usa para trazar celdas).
+- `POST /calibracion`: calibra la cámara con filas de puestos y devuelve las celdas generadas
+  (ver "Calibración por filas").
+- `POST /calibracion/vista-superior`: la imagen actual vista desde arriba, para editar las filas.
 - `GET /video/parqueadero` (`/video`): video en vivo del parqueadero.
 - `GET /video/placas`: video en vivo de la fuente independiente de placas (`PLATE_VIDEO_SOURCE`).
 - `GET /espacios/estado`: ocupación de las celdas y reservas.
@@ -204,6 +207,38 @@ Las pruebas simulan YOLO, así que no necesitan GPU ni video.
    `RESERVATION_TIMEOUT_SECONDS` si nunca llegó a ocuparla.
 5. Si `BACKEND_SYNC_ENABLED=true`, la misma placa confirmada se envía además a
    `educore-backend` para que quede guardada de verdad (no solo en memoria local).
+
+## Calibración por filas
+
+En lugar de marcar cada celda, se marcan **filas** de puestos y las celdas se generan solas.
+Sirve para cualquier cámara: solo se supone que el suelo es plano y que los puestos miden lo
+que dicen sus medidas (por defecto carro 2,5 x 5 m y moto 1,0 x 2,5 m).
+
+Cada fila son cuatro esquinas en la imagen, relativas (0..1): de la 0 a la 1 se recorre el
+frente de la fila (el lado del pasillo) y la 3 es la esquina del fondo que queda detrás de la 0.
+Los puestos se reparten en ese orden.
+
+```json
+POST /calibracion
+{
+  "filas": [
+    {
+      "nombre": "Columna derecha",
+      "esquinas": [[0.70, 0.94], [0.65, 0.42], [0.73, 0.41], [0.99, 0.94]],
+      "puestos": [{"etiqueta": "AR-01", "tipo": "CAR"}, {"etiqueta": "ARM-01", "tipo": "MOTORCYCLE"}],
+      "angulo": 90
+    }
+  ],
+  "medidas": {"CAR": [2.5, 5.0]}
+}
+```
+
+`angulo` es el de los puestos respecto al pasillo (90 perpendiculares, 60 o 45 en diagonal) y
+`medidas` es opcional. La respuesta trae, por cada celda, sus `puntos` en la imagen y su
+polígono en la `planta` (metros), y por cada fila su `error_cm`. Una sola fila ya calibra la
+cámara; con dos o más (`verificada: true`) una fila con error alto indica esquinas mal puestas
+o una cantidad de puestos equivocada. El plano queda como se vería la cámara desde arriba: lo
+cercano a la cámara abajo.
 
 ## Sincronización con el backend
 
