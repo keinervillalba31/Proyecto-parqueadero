@@ -45,6 +45,8 @@ def video_fallback_from_env() -> str:
 class Settings:
     model_path: Path = project_path("YOLO_MODEL", SCRIPT_DIR / "yolo11n.pt")
     cells_path: Path = project_path("PARKING_CELLS", SCRIPT_DIR / "estacionamientos.json")
+    # Cuadro sobre el que se trazaron las celdas: con él se compensa si la cámara se corre.
+    cells_reference_path: Path = project_path("CELLS_REFERENCE", PROJECT_DIR / "referencia_celdas.jpg")
     registered_vehicles_path: Path = project_path(
         "REGISTERED_VEHICLES", SCRIPT_DIR / "vehiculos_registrados.json"
     )
@@ -53,7 +55,9 @@ class Settings:
     yolo_confidence: float = float(os.getenv("YOLO_CONFIDENCE", "0.15"))
     yolo_image_size: int = int(os.getenv("YOLO_IMAGE_SIZE", "960"))
     yolo_tile_grid: int = int(os.getenv("YOLO_TILE_GRID", "2"))
-    occupancy_frames: int = int(os.getenv("OCCUPANCY_FRAMES", "3"))
+    # Segundos seguidos viendo un vehículo para dar un puesto por ocupado, y sin verlo para darlo por libre.
+    occupancy_occupy_seconds: float = float(os.getenv("OCCUPANCY_OCCUPY_SECONDS", "2"))
+    occupancy_free_seconds: float = float(os.getenv("OCCUPANCY_FREE_SECONDS", "8"))
     reservation_timeout_seconds: float = float(
         os.getenv("RESERVATION_TIMEOUT_SECONDS", "600")
     )

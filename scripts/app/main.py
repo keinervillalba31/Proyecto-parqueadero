@@ -10,7 +10,7 @@ from typing import Any
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
@@ -163,6 +163,20 @@ def read_license_plates(image: UploadFile = File(...)) -> dict[str, Any]:
     except Exception as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
     return {"plate": plate, "registered": plate in service.registered_vehicles if plate else False}
+
+
+@app.post("/celdas/referencia")
+async def cells_reference(request: Request) -> dict[str, Any]:
+    """El cuadro sobre el que se trazaron las celdas (JPEG), que el editor envía al guardarlas.
+
+    Con él se compensa el movimiento de la cámara: las celdas siguen a la imagen.
+    """
+    data = await request.body()
+    image = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR) if data else None
+    if image is None:
+        raise HTTPException(status_code=400, detail="La imagen de referencia no es válida")
+    service.parking.aligner.set_reference(image)
+    return {"referencia": "guardada", "ancho": image.shape[1], "alto": image.shape[0]}
 
 
 @app.get("/snapshot")

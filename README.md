@@ -192,8 +192,9 @@ Las pruebas simulan YOLO, así que no necesitan GPU ni video.
 
 1. El administrador configura las coordenadas de las celdas.
 2. YOLO analiza cada cuadro. Una celda está ocupada si el punto inferior central de la
-   caja de un vehículo cae dentro de ella. El cambio de estado solo se acepta después de
-   `OCCUPANCY_FRAMES` cuadros seguidos, para que no parpadee.
+   caja de un vehículo cae dentro de ella. Para que no parpadee, un puesto pasa a ocupado tras
+   `OCCUPANCY_OCCUPY_SECONDS` segundos seguidos viendo el vehículo, y a libre tras
+   `OCCUPANCY_FREE_SECONDS` sin verlo (más tiempo, porque YOLO pierde a ratos los carros lejanos).
 3. Cuando hay un vehículo, cada `PLATE_INTERVAL_FRAMES` cuadros se recortan los vehículos
    más cercanos que no estén estacionados y se envían a Roboflow.
    - Se descarta el texto que no tenga formato de placa (`PLATE_PATTERN`) y se corrigen

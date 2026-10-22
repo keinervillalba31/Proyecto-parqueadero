@@ -13,6 +13,7 @@ import numpy as np
 from .backend_client import BackendClient, BackendError, PlateEntryResult
 from .config import Settings
 from .parking_detector import ParkingDetector, VehicleDetector
+from .alignment import CellAligner
 from .calibration import layout_from_rows
 from .parking_layout import build_layout
 from .plate_reader import PlateReader, vehicle_crops
@@ -39,7 +40,9 @@ class VideoService:
             tile_grid=settings.yolo_tile_grid,
             minimum_box_area=settings.minimum_box_area,
             minimum_motorcycle_area=settings.minimum_motorcycle_area,
-            occupancy_frames=settings.occupancy_frames,
+            occupy_seconds=settings.occupancy_occupy_seconds,
+            free_seconds=settings.occupancy_free_seconds,
+            aligner=CellAligner(settings.cells_reference_path),
         )
         self.plates = PlateReader(
             workspace=settings.roboflow_workspace,
