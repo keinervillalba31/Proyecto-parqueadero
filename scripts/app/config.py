@@ -81,6 +81,10 @@ class Settings:
     video_camera_retry_seconds: float = float(os.getenv("VIDEO_CAMERA_RETRY_SECONDS", "10"))
     service_host: str = os.getenv("SERVICE_HOST", "0.0.0.0")
     service_port: int = int(os.getenv("SERVICE_PORT", "8000"))
+    # Orígenes web que pueden llamar al servicio desde el navegador (el editor de celdas de la plataforma).
+    cors_origins: tuple[str, ...] = tuple(
+        origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://localhost:4200").split(",") if origin.strip()
+    )
     # Dónde se guarda lo que el operador dejó encendido o apagado desde el panel.
     services_state_path: Path = project_path("SERVICES_STATE", PROJECT_DIR / "servicios_activos.json")
     roboflow_workspace: str = os.getenv("ROBOFLOW_WORKSPACE", "")

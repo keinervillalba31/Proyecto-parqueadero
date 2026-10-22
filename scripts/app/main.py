@@ -11,10 +11,11 @@ from typing import Any
 import cv2
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-from .calibration import Calibration, Row, Stall, calibrate, top_down
+from .calibration import Calibration, Row, Stall, calibrate, suggested_corners, top_down
 from .config import settings
 from .video_service import VideoService
 
@@ -50,8 +51,8 @@ class CalibrationIn(BaseModel):
     medidas: dict[str, tuple[float, float]] | None = None
 
 
-def _calibrate(request: CalibrationIn) -> Calibration:
-    rows = [
+def _rows(request: CalibrationIn) -> list[Row]:
+    return [
         Row(
             row.nombre,
             np.array(row.esquinas, dtype=float),
@@ -60,8 +61,11 @@ def _calibrate(request: CalibrationIn) -> Calibration:
         )
         for row in request.filas
     ]
+
+
+def _calibrate(request: CalibrationIn) -> Calibration:
     try:
-        return calibrate(rows, request.medidas)
+        return calibrate(_rows(request), request.medidas)
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
 
@@ -81,6 +85,10 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Monitoreo de parqueadero", lifespan=lifespan)
+# El editor de celdas de la plataforma calibra y pide la vista superior desde el navegador.
+app.add_middleware(
+    CORSMiddleware, allow_origins=list(settings.cors_origins), allow_methods=["GET", "POST"], allow_headers=["Content-Type"],
+)
 
 
 @app.get("/", include_in_schema=False)
@@ -174,12 +182,20 @@ def calibration(request: CalibrationIn) -> dict[str, Any]:
     No guarda nada: la plataforma decide qué celdas guardar.
     """
     result = _calibrate(request)
+    suggestions = suggested_corners(_rows(request), request.medidas)
     return {
         "homografia": result.homography.tolist(),
         "verificada": result.verified,
         "error_cm": round(result.error_m * 100, 1),
         "filas": [
-            {"nombre": row.label, "error_cm": round(row.error_m * 100, 1), "planta": _points(row.ground, 3)}
+            {
+                "nombre": row.label,
+                "error_cm": round(row.error_m * 100, 1),
+                "planta": _points(row.ground, 3),
+                # Dónde deberían ir sus esquinas para encajar con las demás filas (null con una sola fila).
+                "ajustada": _points(suggestions[row.label].corners, 5) if row.label in suggestions else None,
+                "desvio_cm": round(suggestions[row.label].deviation_m * 100, 1) if row.label in suggestions else None,
+            }
             for row in result.rows
         ],
         "celdas": [
@@ -204,7 +220,8 @@ def calibration_top_view(request: CalibrationIn) -> dict[str, Any]:
     frame = service.clean_frame()
     if frame is None:
         raise HTTPException(status_code=503, detail="Aún no hay imagen de la cámara")
-    image, meters_to_pixels = top_down(frame, _calibrate(request))
+    result = _calibrate(request)
+    image, meters_to_pixels = top_down(frame, result)
     ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 85])
     if not ok:
         raise HTTPException(status_code=500, detail="No se pudo generar la vista superior")
@@ -213,6 +230,8 @@ def calibration_top_view(request: CalibrationIn) -> dict[str, Any]:
         "ancho": image.shape[1],
         "alto": image.shape[0],
         "metros_a_pixeles": meters_to_pixels.tolist(),
+        # La de esta imagen: si las filas cambian después, la imagen sigue correspondiendo a esta.
+        "homografia": result.homography.tolist(),
     }
 
 

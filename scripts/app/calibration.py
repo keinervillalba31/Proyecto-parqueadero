@@ -218,6 +218,96 @@ def calibrate(rows: list[Row], sizes: dict[str, tuple[float, float]] | None = No
     return Calibration(homography, tuple(row_fits), tuple(cells))
 
 
+
+def _rigid_fit(source: np.ndarray, target: np.ndarray) -> tuple[np.ndarray, float]:
+    """Giro y traslado que mejor llevan `source` sobre `target`, y la distancia media que queda."""
+    a, b = source - source.mean(axis=0), target - target.mean(axis=0)
+    u, _, vt = np.linalg.svd(a.T @ b)
+    rotation = (u @ vt).T
+    if np.linalg.det(rotation) < 0:            # sin reflejos: el suelo no se ve en espejo
+        vt[-1] *= -1
+        rotation = (u @ vt).T
+    moved = source @ rotation.T + (target.mean(axis=0) - source.mean(axis=0) @ rotation.T)
+    return rotation, float(np.mean(np.linalg.norm(moved - target, axis=1)))
+
+
+# Si al dejar fuera una esquina (o una fila) el resto encaja así de mejor, esa esquina (o fila) se tomó mal.
+_OUTLIER_GAIN = 3.0
+_OUTLIER_MIN_M = 0.15
+
+
+@dataclass(frozen=True)
+class Suggestion:
+    corners: np.ndarray          # (4, 2) dónde deberían ir las esquinas, en la imagen (relativas)
+    deviation_m: float           # cuánto se aleja lo marcado de eso, en la esquina más alejada
+
+
+def _suggest(row: Row, others: list[Row], sizes: dict[str, tuple[float, float]]) -> Suggestion | None:
+    """La fila ubicada según la calibración de las otras filas; None si no se puede."""
+    try:
+        reference = calibrate(others, sizes)
+    except ValueError:
+        return None
+    ideal, _ = _row_shape(row, sizes)
+    ground = apply(reference.homography, np.asarray(row.corners, dtype=float))
+    if not np.isfinite(ground).all():
+        return None
+    keep = np.arange(4)
+    _, full_error = _rigid_fit(ideal, ground)
+    if full_error > _OUTLIER_MIN_M:
+        best_error, worst_corner = min((_rigid_fit(ideal[np.delete(keep, i)], ground[np.delete(keep, i)])[1], i) for i in range(4))
+        if best_error * _OUTLIER_GAIN < full_error:
+            keep = np.delete(keep, worst_corner)
+    rotation, _ = _rigid_fit(ideal[keep], ground[keep])
+    fitted = ideal @ rotation.T + (ground[keep].mean(axis=0) - ideal[keep].mean(axis=0) @ rotation.T)
+    deviation = float(np.linalg.norm(fitted - ground, axis=1).max())
+    return Suggestion(reference.to_image(fitted), deviation)
+
+
+def suggested_corners(
+    rows: list[Row], sizes: dict[str, tuple[float, float]] | None = None,
+) -> dict[str, Suggestion]:
+    """Dónde deberían ir las esquinas de cada fila para encajar con las demás, en la imagen.
+
+    Cada fila se compara con la calibración de las otras filas, para que sus propios errores no
+    la deformen. Si una esquina no encaja con las otras tres (típico: una punta de la fila
+    marcada más larga), se ignora y la fila se ubica con las otras tres.
+    Hace falta al menos otra fila; las que no se pueden comparar no aparecen.
+    """
+    sizes = {**STALL_SIZES, **(sizes or {})}
+    if len(rows) < 2:
+        return {}
+
+    def against(reference: list[Row]) -> dict[str, Suggestion]:
+        found = {}
+        for index, row in enumerate(rows):
+            suggestion = _suggest(row, reference[:index] + reference[index + 1:], sizes)
+            if suggestion is not None:
+                found[row.label] = suggestion
+        return found
+
+    # Una fila mal marcada también descuadra la revisión de las demás: se corrige de a una, la que
+    # peor encaja primero, hasta que todas encajen. Así no se "corrigen" filas buenas.
+    reference = list(rows)
+    cleaned: set[str] = set()
+    for _ in range(len(rows) - 1):
+        found = against(reference)
+        pending = [label for label in found if label not in cleaned]
+        if not pending:
+            break
+        worst = max(pending, key=lambda label: found[label].deviation_m)
+        rest = [found[label].deviation_m for label in found if label != worst]
+        # Solo se corrige una fila que se sale del patrón de las demás. Si todas se desvían parecido, el
+        # problema no es una fila mal marcada (por ejemplo, puestos que no miden lo de siempre).
+        if found[worst].deviation_m <= max(_OUTLIER_MIN_M, _OUTLIER_GAIN * float(np.median(rest))):
+            return found
+        cleaned.add(worst)
+        reference = [
+            Row(row.label, found[worst].corners, row.stalls, row.angle) if row.label == worst else row
+            for row in reference
+        ]
+    return against(reference)
+
 def _plan_frame(h: np.ndarray, ground: np.ndarray) -> np.ndarray:
     """Giro y traslado del plano para verlo como desde la cámara, pero desde arriba.
 

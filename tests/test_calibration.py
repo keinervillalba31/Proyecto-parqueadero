@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from app.calibration import Row, Stall, calibrate, top_down
+from app.calibration import Row, Stall, calibrate, suggested_corners, top_down
 from app.parking_layout import apply
 
 WIDTH, HEIGHT = 1280, 720
@@ -246,3 +246,30 @@ def test_top_down_view_places_the_ground_where_the_matrix_says():
     cell = next(c for c in calibration.cells if c.label == "A-01")
     px, py = apply(meters_to_pixels, np.mean(cell.ground, axis=0)[None])[0].astype(int)
     assert image[py, px].mean() > 200
+
+
+@pytest.mark.parametrize("name", CAMERAS)
+def test_fitting_a_badly_marked_row_puts_its_corners_back_in_place(name):
+    view = CAMERAS[name]
+    rows = marked_rows(view)
+    # La esquina 3 de la fila B se marca corrida: una punta de la fila queda más grande que la otra.
+    bad = rows[1].corners.copy()
+    bad[2] += (bad[2] - bad[1]) * 0.35
+    rows[1] = Row(rows[1].label, bad, rows[1].stalls)
+
+    calibration = calibrate(rows)
+    fitted = suggested_corners(rows)
+    real = apply(view, np.array(GROUND_ROWS[1][1], float))
+
+    # El error se nota en esa fila, y la sugerencia devuelve sus esquinas a donde están en realidad.
+    assert calibration.rows[1].error_m > 0.3
+    assert fitted["B"].corners == pytest.approx(real, abs=1e-3)
+    assert fitted["B"].deviation_m > 1.0
+    # Las filas bien marcadas no se mueven.
+    for row in rows[:1] + rows[2:]:
+        assert fitted[row.label].corners == pytest.approx(row.corners, abs=1e-3), row.label
+        assert fitted[row.label].deviation_m < 0.05, row.label
+
+
+def test_with_a_single_row_there_is_nothing_to_compare():
+    assert suggested_corners(marked_rows(CAMERAS["atras"])[:1]) == {}
