@@ -19,6 +19,7 @@ plataforma, para que la calibración no dependa de la resolución.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import cv2
 import numpy as np
@@ -261,3 +262,127 @@ def top_down(
         flags=cv2.INTER_LINEAR, borderValue=(40, 40, 40),
     )
     return image, meters_to_pixels
+
+
+# --- Plano de planta para el mapa 3D -------------------------------------------------------
+
+# Puestos extra por cada lado de una fila (motos al principio o al final), como en el editor.
+_MAX_ROW_MOTOS = 30
+
+
+def _editor_row(index: int, raw: Any) -> tuple[Row, dict[str, Any]] | None:
+    """Fila tal como la guarda el editor de la plataforma; None si no se puede usar.
+
+    El editor la guarda con: corners (4 esquinas relativas), type, count, angle y las
+    motos que la siguen por fuera de lo marcado (motosStart, motosEnd, motoWidth).
+    """
+    if not isinstance(raw, dict):
+        return None
+    corners = np.asarray(raw.get("corners"), dtype=float) if isinstance(raw.get("corners"), list) else None
+    count = raw.get("count")
+    if corners is None or corners.shape != (4, 2) or not isinstance(count, int) or count < 1:
+        return None
+    kind = "MOTORCYCLE" if raw.get("type") == "MOTORCYCLE" else "CAR"
+    angle = raw.get("angle") if isinstance(raw.get("angle"), (int, float)) else 90.0
+
+    def amount(key: str) -> int:
+        value = raw.get(key)
+        return int(value) if isinstance(value, (int, float)) and 0 <= value <= _MAX_ROW_MOTOS else 0
+
+    moto_width = raw.get("motoWidth")
+    extras = {
+        "type": kind,
+        "count": count,
+        "motos_start": amount("motosStart"),
+        "motos_end": amount("motosEnd"),
+        "moto_width": float(moto_width) if isinstance(moto_width, (int, float)) and 0.5 <= moto_width <= 3 else STALL_SIZES["MOTORCYCLE"][0],
+    }
+    row = Row(str(index), corners, tuple(Stall(f"{index}-{i}", kind) for i in range(count)), float(angle))
+    return row, extras
+
+
+def _row_stalls_ground(fit: RowFit, row: Row, extras: dict[str, Any]) -> list[np.ndarray]:
+    """Cada puesto de la fila en el plano, incluidas las motos de los extremos.
+
+    Se reparte igual que en el editor: a lo largo del frente, con el mismo fondo que la
+    fila. Así cada celda que generó el editor tiene aquí su puesto exacto.
+    """
+    width, length = STALL_SIZES[extras["type"]]
+    angle = np.radians(row.angle)
+    sin = np.sin(angle)
+    pitch, shift, depth = width / sin, length * np.cos(angle), length * sin
+    start = max(0.0, -shift)
+    total = start + extras["count"] * pitch + max(0.0, shift)
+    g0, g1, _, g3 = fit.ground
+    along, inward = (g1 - g0) / total, (g3 - g0) / depth
+
+    def stall(position: float, size: float) -> np.ndarray:
+        points = [(position, 0.0), (position + size, 0.0), (position + size + shift, depth), (position + shift, depth)]
+        return np.array([g0 + u * along + v * inward for u, v in points])
+
+    moto = extras["moto_width"] / sin
+    end = start + extras["count"] * pitch
+    return (
+        [stall(start - (extras["motos_start"] - i) * moto, moto) for i in range(extras["motos_start"])]
+        + [stall(start + i * pitch, pitch) for i in range(extras["count"])]
+        + [stall(end + i * moto, moto) for i in range(extras["motos_end"])]
+    )
+
+
+def _alignment(fits: tuple[RowFit, ...]) -> np.ndarray:
+    """Giro que deja las filas paralelas a los ejes del plano.
+
+    El mapa 3D dibuja cada puesto como un rectángulo alineado con los ejes, así que las
+    filas se enderezan: se gira lo mínimo (menos de 45 grados) para que el frente de las
+    filas quede horizontal o vertical. Lo cercano a la cámara sigue quedando abajo.
+    """
+    angles = np.array([np.arctan2(*(fit.ground[1] - fit.ground[0])[::-1]) for fit in fits])
+    # Promedio de direcciones módulo 90 grados: se multiplican por 4 para que 0, 90, 180 y 270 coincidan.
+    mean = np.arctan2(np.sin(4 * angles).mean(), np.cos(4 * angles).mean()) / 4
+    return _rotation(-mean)
+
+
+def layout_from_rows(
+    cells: dict[str, dict[str, Any]],
+    rows: list[Any],
+) -> list[dict[str, Any]] | None:
+    """Plano de planta de las celdas usando las filas calibradas del editor.
+
+    cells: nombre -> {"points": 4 esquinas relativas, "puesto_id": int | None, "fila": int | None}.
+    rows: las filas tal como las guardó el editor. Las celdas de una fila toman la medida
+    exacta de su puesto; las sueltas se llevan al plano con la misma calibración.
+    Devuelve None si no hay filas utilizables, para seguir con el cálculo anterior.
+    """
+    parsed = {index: entry for index, raw in enumerate(rows or []) if (entry := _editor_row(index, raw))}
+    if not parsed:
+        return None
+    calibration = calibrate([row for row, _ in parsed.values()])
+    turn = _alignment(calibration.rows)
+
+    stalls_by_row = {
+        index: [polygon @ turn.T for polygon in _row_stalls_ground(fit, row, extras)]
+        for (index, (row, extras)), fit in zip(parsed.items(), calibration.rows)
+    }
+    taken: dict[int, set[int]] = {index: set() for index in stalls_by_row}
+
+    layout = []
+    for label, cell in cells.items():
+        if cell.get("puesto_id") is None:
+            continue
+        ground = apply(calibration.homography, np.asarray(cell["points"], dtype=float)) @ turn.T
+        stalls = stalls_by_row.get(cell.get("fila"))
+        if stalls:
+            # La celda es uno de los puestos de su fila: el más cercano que no se haya usado.
+            center = ground.mean(axis=0)
+            order = sorted(range(len(stalls)), key=lambda i: np.linalg.norm(stalls[i].mean(axis=0) - center))
+            chosen = next((i for i in order if i not in taken[cell["fila"]]), order[0])
+            taken[cell["fila"]].add(chosen)
+            ground = stalls[chosen]
+        low, high = ground.min(axis=0), ground.max(axis=0)
+        layout.append({
+            "label": label,
+            "parkingSpaceId": cell["puesto_id"],
+            "x0": round(float(low[0]), 2), "x1": round(float(high[0]), 2),
+            "y0": round(float(low[1]), 2), "y1": round(float(high[1]), 2),
+        })
+    return layout

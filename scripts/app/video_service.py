@@ -13,6 +13,7 @@ import numpy as np
 from .backend_client import BackendClient, BackendError, PlateEntryResult
 from .config import Settings
 from .parking_detector import ParkingDetector, VehicleDetector
+from .calibration import layout_from_rows
 from .parking_layout import build_layout
 from .plate_reader import PlateReader, vehicle_crops
 from .state import RuntimeState
@@ -85,6 +86,7 @@ class VideoService:
         self.cells_version: str | None = None
         # Celdas de la plataforma (relativas) y para cuáles ya se envió el plano de planta.
         self.platform_cells: dict[str, dict[str, Any]] = {}
+        self.platform_rows: list[Any] = []
         self.layout_reported_for: tuple[str | None, int, int] | None = None
         self.occupancy_thread: threading.Thread | None = None
         self.services_thread: threading.Thread | None = None
@@ -568,6 +570,7 @@ class VideoService:
                 "points": cell["points"],
                 "puesto_id": cell.get("parkingSpaceId"),
                 "puesto": cell.get("parkingSpaceNumber"),
+                "fila": cell.get("row"),
             }
             for cell in data.get("cells", [])
         }
@@ -578,6 +581,7 @@ class VideoService:
 
         self.parking.set_relative_cells(cells)
         self.platform_cells = cells
+        self.platform_rows = data.get("rows") or []
         self.state.update_source({"celdas_origen": "plataforma", "celdas_version": version})
         log.info("Celdas actualizadas desde la plataforma: %d (versión %s)", len(cells), version)
         return True
@@ -597,7 +601,10 @@ class VideoService:
         if key == self.layout_reported_for:
             return False
         try:
-            layout = build_layout(self.platform_cells, width, height)
+            # Con filas del editor el plano sale de su calibración; sin ellas, del cálculo anterior.
+            layout = layout_from_rows(self.platform_cells, self.platform_rows)
+            if layout is None:
+                layout = build_layout(self.platform_cells, width, height)
         except ValueError as error:
             log.warning("No se pudo calcular el plano del parqueadero: %s", error)
             self.layout_reported_for = key        # no se reintenta hasta que cambien las celdas
