@@ -206,6 +206,12 @@ def calibrate(rows: list[Row], sizes: dict[str, tuple[float, float]] | None = No
     to_plan = _plan_frame(h, np.vstack(placed))
     homography = to_plan @ h @ _CENTER
     homography = homography / homography[2, 2]
+    # Escala con el signo que deja positiva la coordenada homogénea del suelo marcado: la
+    # esquina (0, 0) suele ser cielo, detrás del horizonte, y ahí quedaría negativa. Así,
+    # quien proyecte puntos puede descartar los de detrás de la cámara con w <= 0.
+    relative = np.vstack([np.asarray(row.corners, dtype=float) for row in rows])
+    if np.mean(relative @ homography[2, :2] + homography[2, 2]) < 0:
+        homography = -homography
     inverse = np.linalg.inv(homography)
 
     row_fits, cells = [], []
@@ -328,13 +334,16 @@ def _plan_frame(h: np.ndarray, ground: np.ndarray) -> np.ndarray:
 def top_down(
     frame: np.ndarray,
     calibration: Calibration,
-    margin_m: float = 5.0,
-    max_side: int = 1400,
+    margin_m: float = 2.0,
+    max_side: int = 1600,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """La imagen de la cámara vista desde arriba, y la matriz metros -> píxeles de esa imagen.
+    """La imagen de la cámara vista desde arriba, como la de un dron, y la matriz metros -> píxeles.
 
-    Solo cubre las filas más un margen: más lejos el suelo se estira tanto que
-    deja de servir para editar.
+    Solo cubre las filas más un margen: más lejos el suelo se estira tanto que deja de
+    servir. Se limpia el grano del video sin borrar los bordes, y lo que la cámara no ve
+    se rellena con una continuación borrosa y oscura de la imagen en vez de un fondo gris.
+    Los objetos altos (carros, árboles) siguen viéndose inclinados: con una sola cámara de
+    lado no se sabe cómo son por arriba.
     """
     height, width = frame.shape[:2]
     corners = np.vstack([row.ground for row in calibration.rows])
@@ -347,11 +356,42 @@ def top_down(
     ])
     to_relative = np.diag([1.0 / width, 1.0 / height, 1.0])
     size = tuple(int(np.ceil(v)) for v in (high - low) * pixels_per_m)
-    image = cv2.warpPerspective(
-        frame, meters_to_pixels @ calibration.homography @ to_relative, size,
-        flags=cv2.INTER_LINEAR, borderValue=(40, 40, 40),
-    )
-    return image, meters_to_pixels
+    warp = meters_to_pixels @ calibration.homography @ to_relative
+    image = cv2.warpPerspective(frame, warp, size, flags=cv2.INTER_CUBIC, borderValue=(0, 0, 0))
+    seen = cv2.warpPerspective(np.full((height, width), 255, np.uint8), warp, size, flags=cv2.INTER_NEAREST)
+    # El borde de lo visto se mezcla con el negro de fuera al interpolar: se descarta.
+    seen = cv2.erode(seen, np.ones((5, 5), np.uint8))
+
+    image = _fill_unseen(image, seen > 0)
+    image = cv2.bilateralFilter(image, 7, 28, 5)
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV).astype(np.float32)
+    hsv[..., 1] = np.clip(hsv[..., 1] * 1.12, 0, 255)
+    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR), meters_to_pixels
+
+
+def _fill_unseen(image: np.ndarray, seen: np.ndarray) -> np.ndarray:
+    """Rellena lo que la cámara no ve prolongando, borroso y oscuro, el color de los bordes."""
+    if seen.all() or not seen.any():
+        return image
+    mask = seen.astype(np.float32)
+    # A un octavo del tamaño, cada vez más borroso, para que el relleno llegue lejos sin costar mucho.
+    small_image = cv2.resize(image.astype(np.float32) * mask[..., None], None, fx=0.125, fy=0.125, interpolation=cv2.INTER_AREA)
+    small_mask = cv2.resize(mask, None, fx=0.125, fy=0.125, interpolation=cv2.INTER_AREA)
+    for sigma in (3, 10, 27):
+        blurred = cv2.GaussianBlur(small_image, (0, 0), sigma)
+        weight = cv2.GaussianBlur(small_mask, (0, 0), sigma)
+        known = small_mask > 0.02
+        colors = np.where(known[..., None], small_image / np.maximum(small_mask, 1e-4)[..., None],
+                          blurred / np.maximum(weight, 1e-4)[..., None])
+        small_mask = np.maximum(small_mask, (weight > 1e-3).astype(np.float32))
+        small_image = colors * small_mask[..., None]
+    colors = small_image / np.maximum(small_mask, 1e-4)[..., None]
+    fill = cv2.resize(colors, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_CUBIC)
+    fill = cv2.GaussianBlur(fill, (0, 0), 6) * 0.55
+    # Transición suave solo hacia afuera: dentro de lo visto la imagen queda intacta.
+    alpha = np.maximum(mask, cv2.GaussianBlur(mask, (0, 0), 3))[..., None]
+    outside = np.where(seen[..., None], image.astype(np.float32), fill)
+    return np.clip(outside * alpha + fill * (1 - alpha), 0, 255).astype(np.uint8)
 
 
 # --- Plano de planta para el mapa 3D -------------------------------------------------------

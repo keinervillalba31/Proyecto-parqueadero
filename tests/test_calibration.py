@@ -273,3 +273,24 @@ def test_fitting_a_badly_marked_row_puts_its_corners_back_in_place(name):
 
 def test_with_a_single_row_there_is_nothing_to_compare():
     assert suggested_corners(marked_rows(CAMERAS["atras"])[:1]) == {}
+
+
+@pytest.mark.parametrize("name", list(CAMERAS))
+def test_the_ground_has_positive_homogeneous_coordinate(name):
+    # La esquina (0, 0) de la imagen suele ser cielo: si la escala dejara negativo el suelo,
+    # el editor descartaría todos los puntos como si estuvieran detrás de la cámara.
+    calibration = calibrate(marked_rows(CAMERAS[name]))
+    corners = np.vstack([row.corners for row in marked_rows(CAMERAS[name])])
+    w = corners @ calibration.homography[2, :2] + calibration.homography[2, 2]
+    assert np.all(w > 0)
+
+
+def test_top_down_view_fills_what_the_camera_does_not_see():
+    view = CAMERAS["esquina"]
+    calibration = calibrate(marked_rows(view))
+    frame = np.full((HEIGHT, WIDTH, 3), 120, np.uint8)
+
+    image, _ = top_down(frame, calibration, max_side=600)
+
+    # Sin triángulos negros: lo que queda fuera se prolonga más oscuro, no en negro.
+    assert image.min() > 30

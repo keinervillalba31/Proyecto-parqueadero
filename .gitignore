@@ -8,3 +8,6 @@ __pycache__/
 salida_placas/
 servicios_activos.json
 servicio.log
+
+# Cuadro de referencia de las celdas (lo guarda el servicio)
+referencia_celdas.jpg
