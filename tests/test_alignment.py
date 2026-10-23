@@ -100,3 +100,29 @@ def test_a_discarded_estimated_reference_is_not_shown_anymore():
     assert aligner.source == "estimada" and aligner.reference_jpeg() is not None
     aligner.cells_changed()
     assert aligner.reference_jpeg() is None
+
+
+def test_health_reports_how_far_the_camera_moved_and_when_it_lost_the_reference():
+    reference = scene()
+    aligner = CellAligner()
+    aligner.set_reference(reference)
+
+    aligner.transform(warp(reference, moved_by(25.6, 0)))
+    health = aligner.health()
+    # 25,6 px de 1280 = 2 % del ancho.
+    assert health["desplazamiento_pct"] == pytest.approx(2.0, abs=0.3)
+    assert health["fallos_seguidos"] == 0
+
+    other = scene(seed=99)
+    aligner.transform(other)
+    aligner.transform(other)
+    assert aligner.health()["fallos_seguidos"] == 2
+
+    aligner.transform(reference)
+    assert aligner.health()["fallos_seguidos"] == 0
+
+
+def test_without_reference_there_are_no_failures_to_report():
+    aligner = CellAligner()
+    aligner.transform(scene())
+    assert aligner.health()["fallos_seguidos"] == 0

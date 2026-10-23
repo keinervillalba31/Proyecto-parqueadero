@@ -352,6 +352,14 @@ class BackendClient:
             )
         return response.json().get("data") or {}
 
+    def camera_heartbeat(self, camera_id: int, payload: dict[str, Any]) -> None:
+        """Estado de la cámara del servicio de una sola cámara (sin nodo)."""
+        response = self._mutating_request("POST", f"/api/monitoring/cameras/{camera_id}/heartbeat", json=payload)
+        if response.status_code != 200:
+            raise BackendError(
+                f"El backend rechazó el estado de la cámara {camera_id} ({response.status_code}): {response.text[:200]}"
+            )
+
     def node_heartbeat(self, node_code: str, payload: dict[str, Any]) -> None:
         """Le dice a la plataforma que el nodo sigue vivo, dónde está y cómo va cada cámara."""
         response = self._mutating_request("POST", f"/api/monitoring/nodes/{node_code}/heartbeat", json=payload)

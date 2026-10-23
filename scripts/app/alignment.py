@@ -62,6 +62,10 @@ class CellAligner:
         # Último movimiento medido: cuadro actual -> referencia (None si no se compensa).
         self.last_transform: np.ndarray | None = None
         self.last_shift = (0.0, 0.0)
+        # Análisis seguidos en que había referencia pero el cuadro no se pudo alinear con ella:
+        # la cámara se movió mucho, algo la tapa, o es otra escena.
+        self.failures = 0
+        self.last_width = 0
         if reference_path is not None and reference_path.exists():
             image = cv2.imread(str(reference_path))
             if image is not None:
@@ -130,6 +134,24 @@ class CellAligner:
 
     def transform(self, frame: np.ndarray) -> np.ndarray | None:
         """Homografía que lleva un punto del cuadro actual a donde estaba en la referencia; None si no se sabe."""
+        self.last_width = frame.shape[1]
+        result = self._transform(frame)
+        with self._lock:
+            has_reference = self._reference is not None
+        self.failures = 0 if result is not None or not has_reference else self.failures + 1
+        return result
+
+    def health(self) -> dict[str, object]:
+        """Qué tan corrida está la cámara respecto del trazado, para avisar que hay que recalibrar."""
+        shift = float(np.hypot(*self.last_shift))
+        return {
+            "referencia": self.source,
+            # Desplazamiento del centro de la imagen, en % del ancho.
+            "desplazamiento_pct": round(shift / self.last_width * 100, 2) if self.last_width else 0.0,
+            "fallos_seguidos": self.failures,
+        }
+
+    def _transform(self, frame: np.ndarray) -> np.ndarray | None:
         with self._lock:
             reference = self._reference
         if reference is None:

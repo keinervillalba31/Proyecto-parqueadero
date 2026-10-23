@@ -113,6 +113,9 @@ class VisionNode:
             worker = self._worker_factory(self.settings)
             self.workers[self.settings.backend_camera_id or 0] = worker
             worker.start()
+            if self.backend and self.settings.backend_camera_id is not None:
+                # También avisa si está viva y si se movió, para las alertas de Monitoreo.
+                self._spawn(self._camera_heartbeat_loop, "camera-heartbeat")
             return
         log.info("Nodo de visión %s: buscando sus cámaras", self.settings.node_code or "(simulación)")
         self.sync()
@@ -295,6 +298,35 @@ class VisionNode:
             ],
         }
 
+    @staticmethod
+    def camera_report(camera: dict[str, Any]) -> dict[str, Any]:
+        """Lo que se le dice a la plataforma de una cámara: si transmite y si se corrió del trazado."""
+        alignment = camera.get("alineacion") or {}
+        return {
+            "online": bool(camera["en_linea"]),
+            "error": camera["error"],
+            "fpsVideo": camera["fps_video"],
+            "fpsAnalysis": camera["fps_analisis"],
+            "shiftPercent": alignment.get("desplazamiento_pct"),
+            "alignmentFailures": alignment.get("fallos_seguidos"),
+        }
+
+    def _camera_heartbeat_loop(self) -> None:
+        camera_id = self.settings.backend_camera_id
+        failing = False
+        while self.running:
+            worker = self.worker(camera_id)
+            if worker is not None:
+                try:
+                    report = self.camera_report({**worker.summary(), "id": camera_id})
+                    self.backend.camera_heartbeat(camera_id, {"status": "ONLINE" if report["online"] else "OFFLINE", **report})
+                    failing = False
+                except BackendError as error:
+                    if not failing:
+                        log.warning("No se pudo reportar el estado de la cámara: %s", error)
+                    failing = True
+            self._sleep(self.settings.node_heartbeat_seconds)
+
     def _heartbeat_loop(self) -> None:
         while self.running:
             status = self.status()
@@ -305,13 +337,7 @@ class VisionNode:
                         "baseUrl": status["url"],
                         "device": status["dispositivo"],
                         "cameras": [
-                            {
-                                "id": camera["id"],
-                                "online": bool(camera["en_linea"]),
-                                "error": camera["error"],
-                                "fpsVideo": camera["fps_video"],
-                                "fpsAnalysis": camera["fps_analisis"],
-                            }
+                            {"id": camera["id"], **self.camera_report(camera)}
                             for camera in status["camaras"]
                             if camera["id"] is not None
                         ],

@@ -182,7 +182,8 @@ def test_the_node_takes_its_cameras_from_the_platform_and_reports_them(tmp_path)
         code, payload = backend.heartbeats[0]
         assert code == "nodo-norte"
         assert payload["baseUrl"] == "http://10.0.0.5:8000"
-        assert payload["cameras"] == [{"id": 4, "online": True, "error": None, "fpsVideo": 10.0, "fpsAnalysis": 0.3}]
+        assert payload["cameras"] == [{"id": 4, "online": True, "error": None, "fpsVideo": 10.0, "fpsAnalysis": 0.3,
+                                       "shiftPercent": None, "alignmentFailures": None}]
     finally:
         node.stop()
 

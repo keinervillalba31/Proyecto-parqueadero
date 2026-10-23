@@ -1031,4 +1031,5 @@ class VideoService:
             "analisis_hechos": getattr(self, "analysis_count", 0),
             "ocupadas": current.get("ocupadas"),
             "total_celdas": current.get("total_celdas"),
+            "alineacion": self.parking.aligner.health() if self.parking.aligner is not None else None,
         }
