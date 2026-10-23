@@ -179,6 +179,27 @@ async def cells_reference(request: Request) -> dict[str, Any]:
     return {"referencia": "guardada", "ancho": image.shape[1], "alto": image.shape[0]}
 
 
+@app.get("/celdas/referencia")
+def cells_reference_image() -> Response:
+    """El cuadro sobre el que se trazaron las celdas, para que el editor las muestre donde se trazaron.
+
+    Con la cámara moviéndose, un cuadro actual queda corrido respecto de las celdas aunque
+    la detección lo compense. La cabecera X-Referencia dice si la guardó el editor o se estimó.
+    """
+    image = service.parking.aligner.reference_jpeg()
+    if image is None:
+        raise HTTPException(status_code=404, detail="Todavía no hay imagen de referencia")
+    return Response(
+        content=image,
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Referencia": service.parking.aligner.source,
+            "Access-Control-Expose-Headers": "X-Referencia",
+        },
+    )
+
+
 @app.get("/snapshot")
 def snapshot() -> Response:
     """Cuadro actual sin dibujos (para trazar celdas desde la plataforma)."""
@@ -226,12 +247,16 @@ def calibration(request: CalibrationIn) -> dict[str, Any]:
 
 
 @app.post("/calibracion/vista-superior")
-def calibration_top_view(request: CalibrationIn) -> dict[str, Any]:
-    """La imagen actual de la cámara vista desde arriba, para editar las filas sobre ella.
+def calibration_top_view(request: CalibrationIn, imagen: str = "actual") -> dict[str, Any]:
+    """La imagen de la cámara vista desde arriba, para editar las filas sobre ella.
 
-    `metros_a_pixeles` lleva un punto del plano (en metros) a un píxel de esta imagen.
+    Con `imagen=referencia` se usa el cuadro sobre el que se trazaron las celdas (si lo hay),
+    para que coincida con lo que muestra el editor. `metros_a_pixeles` lleva un punto del
+    plano (en metros) a un píxel de esta imagen.
     """
-    frame = service.clean_frame()
+    frame = service.parking.aligner.reference_frame() if imagen == "referencia" else None
+    if frame is None:
+        frame = service.clean_frame()
     if frame is None:
         raise HTTPException(status_code=503, detail="Aún no hay imagen de la cámara")
     result = _calibrate(request)

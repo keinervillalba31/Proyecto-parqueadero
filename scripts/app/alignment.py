@@ -52,6 +52,8 @@ class CellAligner:
         self.estimation_frames = estimation_frames
         self._lock = threading.Lock()
         self._reference: _Features | None = None
+        # El cuadro de referencia tal cual, para mostrarlo en el editor de celdas.
+        self._image: np.ndarray | None = None
         self._matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
         # "guardada": la envió el editor al guardar las celdas; "estimada": la eligió el servicio.
         self.source = "ninguna"
@@ -70,6 +72,7 @@ class CellAligner:
         features = _Features(frame)
         with self._lock:
             self._reference = features
+            self._image = frame.copy()
             self.source = source
             self._candidates = 0
             self._best = None
@@ -85,6 +88,7 @@ class CellAligner:
         with self._lock:
             if self.source == "estimada":
                 self._reference = None
+                self._image = None
                 self.source = "ninguna"
             self._candidates = 0
             self._best = None
@@ -106,6 +110,19 @@ class CellAligner:
         if done and best is not None:
             self._set(best[1], "estimada")
             log.info("Referencia de las celdas estimada: %d celdas coinciden con vehículos", best[0])
+
+    def reference_frame(self) -> np.ndarray | None:
+        """Copia del cuadro de referencia; None si todavía no hay."""
+        with self._lock:
+            return None if self._image is None else self._image.copy()
+
+    def reference_jpeg(self) -> bytes | None:
+        """El cuadro de referencia en JPEG; None si todavía no hay."""
+        image = self.reference_frame()
+        if image is None:
+            return None
+        ok, buffer = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        return buffer.tobytes() if ok else None
 
     def _reset(self) -> None:
         self.last_transform = None

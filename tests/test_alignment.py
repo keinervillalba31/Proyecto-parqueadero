@@ -77,3 +77,26 @@ def test_new_cells_discard_an_estimated_reference_but_not_a_saved_one():
     aligner.set_reference(scene())
     aligner.cells_changed()
     assert aligner.source == "guardada"
+
+
+def test_the_editor_can_get_back_the_frame_the_cells_were_traced_on(tmp_path):
+    aligner = CellAligner()
+    assert aligner.reference_jpeg() is None
+
+    reference = scene()
+    aligner.set_reference(reference)
+    image = cv2.imdecode(np.frombuffer(aligner.reference_jpeg(), np.uint8), cv2.IMREAD_COLOR)
+    assert image.shape == reference.shape
+    assert np.abs(image.astype(int) - reference.astype(int)).mean() < 3
+
+    path = tmp_path / "referencia.jpg"
+    CellAligner(path).set_reference(reference)
+    assert CellAligner(path).reference_jpeg() is not None
+
+
+def test_a_discarded_estimated_reference_is_not_shown_anymore():
+    aligner = CellAligner(estimation_frames=1)
+    aligner.consider(scene(), fit=5)
+    assert aligner.source == "estimada" and aligner.reference_jpeg() is not None
+    aligner.cells_changed()
+    assert aligner.reference_jpeg() is None
