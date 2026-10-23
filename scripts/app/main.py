@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 from .calibration import Calibration, Row, Stall, calibrate, suggested_corners, top_down
 from .config import settings
 from .video_service import VideoService
+from .vision_node import VisionNode
 
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
@@ -74,14 +75,25 @@ def _points(points: np.ndarray, decimals: int) -> list[list[float]]:
     return np.round(points, decimals).tolist()
 
 
-service = VideoService(settings)
+node = VisionNode(settings)
+
+
+def _camera(camera_id: int | None) -> VideoService:
+    """La cámara de la ruta: /camaras/{id}/... o, sin número, la única (o la primera de ocupación)."""
+    worker = node.default_worker() if camera_id is None else node.worker(camera_id)
+    if worker is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Este nodo no atiende esa cámara" if camera_id is not None else "El nodo aún no tiene cámaras",
+        )
+    return worker
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    service.start()
+    node.start()
     yield
-    service.stop()
+    node.stop()
 
 
 app = FastAPI(title="Monitoreo de parqueadero", lifespan=lifespan)
@@ -97,29 +109,42 @@ def panel() -> FileResponse:
     return FileResponse(PANEL_PATH, media_type="text/html", headers={"Cache-Control": "no-store"})
 
 
+@app.get("/nodo")
+def node_status() -> dict[str, Any]:
+    """Qué cámaras atiende este proceso, con qué dispositivo y cómo va cada una."""
+    return node.status()
+
+
 @app.get("/servicios")
-def services() -> dict[str, bool]:
-    return service.services()
+@app.get("/camaras/{camera_id}/servicios")
+def services(camera_id: int | None = None) -> dict[str, bool]:
+    return _camera(camera_id).services()
 
 
 @app.post("/servicios")
-def change_services(change: ServicesChange) -> dict[str, bool]:
-    return service.set_services(spaces=change.espacios, plates=change.placas)
+@app.post("/camaras/{camera_id}/servicios")
+def change_services(change: ServicesChange, camera_id: int | None = None) -> dict[str, bool]:
+    return _camera(camera_id).set_services(spaces=change.espacios, plates=change.placas)
 
 
 @app.get("/health")
-def health() -> dict[str, str | bool]:
-    return service.health()
+@app.get("/camaras/{camera_id}/health")
+def health(camera_id: int | None = None) -> dict[str, str | bool]:
+    if camera_id is None and node.default_worker() is None:
+        return {"ok": node.mode == "nodo", "error": node.last_sync_error or "", "fuente": "nodo"}
+    return _camera(camera_id).health()
 
 
 @app.get("/estado")
-def state() -> dict[str, Any]:
-    return service.state.snapshot()
+@app.get("/camaras/{camera_id}/estado")
+def state(camera_id: int | None = None) -> dict[str, Any]:
+    return _camera(camera_id).state.snapshot()
 
 
 @app.get("/espacios/estado")
-def spaces_state() -> dict[str, Any]:
-    current = service.state.snapshot()
+@app.get("/camaras/{camera_id}/espacios/estado")
+def spaces_state(camera_id: int | None = None) -> dict[str, Any]:
+    current = _camera(camera_id).state.snapshot()
     return {
         key: current.get(key)
         for key in (
@@ -136,13 +161,15 @@ def spaces_state() -> dict[str, Any]:
 
 
 @app.get("/placas/estado")
-def plates_state() -> dict[str, Any]:
-    return service.state.snapshot().get("placa", {})
+@app.get("/camaras/{camera_id}/placas/estado")
+def plates_state(camera_id: int | None = None) -> dict[str, Any]:
+    return _camera(camera_id).state.snapshot().get("placa", {})
 
 
 @app.get("/reservas")
-def reservations() -> dict[str, Any]:
-    return service.state.snapshot().get("reservas", {})
+@app.get("/camaras/{camera_id}/reservas")
+def reservations(camera_id: int | None = None) -> dict[str, Any]:
+    return _camera(camera_id).state.snapshot().get("reservas", {})
 
 
 @app.post("/vision/license-plates")
@@ -158,35 +185,47 @@ def read_license_plates(image: UploadFile = File(...)) -> dict[str, Any]:
     if frame is None:
         raise HTTPException(status_code=415, detail="No se pudo leer la imagen")
 
+    camera = _camera(None)
     try:
-        plate = service.plates.read(frame)
+        plate = camera.plates.read(frame)
     except Exception as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
-    return {"plate": plate, "registered": plate in service.registered_vehicles if plate else False}
+    return {"plate": plate, "registered": plate in camera.registered_vehicles if plate else False}
+
+
+def _aligner(camera_id: int | None):
+    aligner = _camera(camera_id).parking.aligner
+    if aligner is None:
+        raise HTTPException(status_code=409, detail="Esta cámara no detecta espacios: no tiene celdas")
+    return aligner
 
 
 @app.post("/celdas/referencia")
-async def cells_reference(request: Request) -> dict[str, Any]:
+@app.post("/camaras/{camera_id}/celdas/referencia")
+async def cells_reference(request: Request, camera_id: int | None = None) -> dict[str, Any]:
     """El cuadro sobre el que se trazaron las celdas (JPEG), que el editor envía al guardarlas.
 
     Con él se compensa el movimiento de la cámara: las celdas siguen a la imagen.
     """
+    aligner = _aligner(camera_id)
     data = await request.body()
     image = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR) if data else None
     if image is None:
         raise HTTPException(status_code=400, detail="La imagen de referencia no es válida")
-    service.parking.aligner.set_reference(image)
+    aligner.set_reference(image)
     return {"referencia": "guardada", "ancho": image.shape[1], "alto": image.shape[0]}
 
 
 @app.get("/celdas/referencia")
-def cells_reference_image() -> Response:
+@app.get("/camaras/{camera_id}/celdas/referencia")
+def cells_reference_image(camera_id: int | None = None) -> Response:
     """El cuadro sobre el que se trazaron las celdas, para que el editor las muestre donde se trazaron.
 
     Con la cámara moviéndose, un cuadro actual queda corrido respecto de las celdas aunque
     la detección lo compense. La cabecera X-Referencia dice si la guardó el editor o se estimó.
     """
-    image = service.parking.aligner.reference_jpeg()
+    aligner = _aligner(camera_id)
+    image = aligner.reference_jpeg()
     if image is None:
         raise HTTPException(status_code=404, detail="Todavía no hay imagen de referencia")
     return Response(
@@ -194,27 +233,30 @@ def cells_reference_image() -> Response:
         media_type="image/jpeg",
         headers={
             "Cache-Control": "no-store",
-            "X-Referencia": service.parking.aligner.source,
+            "X-Referencia": aligner.source,
             "Access-Control-Expose-Headers": "X-Referencia",
         },
     )
 
 
 @app.get("/snapshot")
-def snapshot() -> Response:
+@app.get("/camaras/{camera_id}/snapshot")
+def snapshot(camera_id: int | None = None) -> Response:
     """Cuadro actual sin dibujos (para trazar celdas desde la plataforma)."""
-    image = service.snapshot_jpeg()
+    image = _camera(camera_id).snapshot_jpeg()
     if image is None:
         raise HTTPException(status_code=503, detail="Aún no hay imagen de la cámara")
     return Response(content=image, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
 
 @app.post("/calibracion")
-def calibration(request: CalibrationIn) -> dict[str, Any]:
+@app.post("/camaras/{camera_id}/calibracion")
+def calibration(request: CalibrationIn, camera_id: int | None = None) -> dict[str, Any]:
     """Calibra la cámara con las filas marcadas y devuelve las celdas de cada puesto.
 
     Las coordenadas de imagen son relativas (0..1); las del plano, en metros.
-    No guarda nada: la plataforma decide qué celdas guardar.
+    No guarda nada: la plataforma decide qué celdas guardar. No depende de la cámara: la
+    ruta con número existe para que el editor use una sola dirección base por cámara.
     """
     result = _calibrate(request)
     suggestions = suggested_corners(_rows(request), request.medidas)
@@ -247,16 +289,19 @@ def calibration(request: CalibrationIn) -> dict[str, Any]:
 
 
 @app.post("/calibracion/vista-superior")
-def calibration_top_view(request: CalibrationIn, imagen: str = "actual") -> dict[str, Any]:
+@app.post("/camaras/{camera_id}/calibracion/vista-superior")
+def calibration_top_view(request: CalibrationIn, imagen: str = "actual", camera_id: int | None = None) -> dict[str, Any]:
     """La imagen de la cámara vista desde arriba, para editar las filas sobre ella.
 
     Con `imagen=referencia` se usa el cuadro sobre el que se trazaron las celdas (si lo hay),
     para que coincida con lo que muestra el editor. `metros_a_pixeles` lleva un punto del
     plano (en metros) a un píxel de esta imagen.
     """
-    frame = service.parking.aligner.reference_frame() if imagen == "referencia" else None
+    camera = _camera(camera_id)
+    aligner = camera.parking.aligner
+    frame = aligner.reference_frame() if imagen == "referencia" and aligner is not None else None
     if frame is None:
-        frame = service.clean_frame()
+        frame = camera.clean_frame()
     if frame is None:
         raise HTTPException(status_code=503, detail="Aún no hay imagen de la cámara")
     result = _calibrate(request)
@@ -293,12 +338,14 @@ def _mjpeg_stream(
 
 @app.get("/video")
 @app.get("/video/parqueadero")
-def parking_video_stream() -> StreamingResponse:
-    return _mjpeg_stream(service.state.get_frame)
+@app.get("/camaras/{camera_id}/video")
+def parking_video_stream(camera_id: int | None = None) -> StreamingResponse:
+    return _mjpeg_stream(_camera(camera_id).state.get_frame)
 
 
 @app.get("/video/placas")
 def plate_video_stream() -> StreamingResponse:
+    service = _camera(None)
     if not service.settings.plate_video_source:
         raise HTTPException(
             status_code=503,
@@ -310,11 +357,14 @@ def plate_video_stream() -> StreamingResponse:
 
 
 @app.websocket("/ws/estado")
-async def state_websocket(websocket: WebSocket) -> None:
+@app.websocket("/camaras/{camera_id}/ws/estado")
+async def state_websocket(websocket: WebSocket, camera_id: int | None = None) -> None:
     await websocket.accept()
     try:
         while True:
-            await websocket.send_json(service.state.snapshot())
+            worker = node.default_worker() if camera_id is None else node.worker(camera_id)
+            if worker is not None:
+                await websocket.send_json(worker.state.snapshot())
             await asyncio.sleep(0.5)
     except (WebSocketDisconnect, RuntimeError):
         return

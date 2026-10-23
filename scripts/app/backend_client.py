@@ -332,6 +332,30 @@ class BackendClient:
             raw=data,
         )
 
-    def sync_plate_detection(self, plate: str) -> PlateEntryResult:
-        """Punto de entrada único: placa confirmada en la entrada -> puesto + ticket."""
-        return self.register_plate_entry(plate, self.settings.backend_parking_id)
+    def sync_plate_detection(self, plate: str, parking_id: int | None | object = ...) -> PlateEntryResult:
+        """Punto de entrada único: placa confirmada en la entrada -> puesto + ticket.
+
+        En un nodo el cliente es de todas las cámaras: cada entrada dice su parqueadero.
+        """
+        chosen = self.settings.backend_parking_id if parking_id is ... else parking_id
+        return self.register_plate_entry(plate, chosen)
+
+    # -- nodo de visión -----------------------------------------------------
+
+    def get_node_config(self, node_code: str) -> dict[str, Any]:
+        """Las cámaras que le tocan a este nodo y los interruptores generales de la plataforma."""
+        response = self._request("GET", f"/api/monitoring/nodes/{node_code}/config")
+        if response.status_code != 200:
+            raise BackendError(
+                f"No se pudo consultar la configuración del nodo {node_code} "
+                f"({response.status_code}): {response.text[:200]}"
+            )
+        return response.json().get("data") or {}
+
+    def node_heartbeat(self, node_code: str, payload: dict[str, Any]) -> None:
+        """Le dice a la plataforma que el nodo sigue vivo, dónde está y cómo va cada cámara."""
+        response = self._mutating_request("POST", f"/api/monitoring/nodes/{node_code}/heartbeat", json=payload)
+        if response.status_code != 200:
+            raise BackendError(
+                f"El backend rechazó el estado del nodo {node_code} ({response.status_code}): {response.text[:200]}"
+            )

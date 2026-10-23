@@ -187,6 +187,61 @@ Las pruebas simulan YOLO, así que no necesitan GPU ni video.
 - `GET /estado`: estado combinado. También se publica cada 0.5 s por WebSocket en `/ws/estado`.
 - `GET /health`: indica si el hilo de video funciona.
 - `POST /vision/license-plates`: prueba puntual con una imagen (máximo 10 MB).
+- `GET /nodo`: cámaras que atiende el proceso, dispositivo (CPU o GPU) y estado de cada una.
+- Todas las rutas de una cámara existen también como `/camaras/{id}/...` (por ejemplo
+  `/camaras/4/video`, `/camaras/4/snapshot`, `/camaras/4/celdas/referencia`). Sin número usan
+  la cámara única o, en un nodo, la primera de ocupación.
+
+## Nodo de visión (varias cámaras)
+
+Un solo proceso puede atender todas las cámaras de un parqueadero (o del campus) con **un solo
+modelo YOLO** en memoria. Las cámaras se turnan el modelo, y cada una se analiza cada pocos
+segundos: la ocupación no necesita más, porque la histéresis ya pide varios segundos para
+cambiar un puesto.
+
+Con la plataforma:
+
+```
+BACKEND_SYNC_ENABLED=true
+NODE_CODE=nodo-norte              # el código del nodo en Monitoreo > Nodos
+NODE_PUBLIC_URL=http://10.0.0.5:8000   # cómo llega la plataforma a este equipo
+```
+
+El nodo le pregunta a la plataforma cada `NODE_CONFIG_POLL_SECONDS` qué cámaras le tocan
+(fuente, tipo, parqueadero, si está encendida) y las arranca, las para o las rearma solas; y
+cada `NODE_HEARTBEAT_SECONDS` le reporta su URL, si usa GPU y cómo va cada cámara. Si el nodo
+no existe en la plataforma, se registra solo en su primer reporte.
+
+Tipos de cámara: `OCCUPANCY` (ve los puestos), `ENTRY` (lee placas en una entrada) y `MIXED`
+(las dos cosas, como la instalación de una sola cámara). Lo de cada cámara (celdas locales,
+referencia del trazado, interruptores) se guarda en `camaras/<id>/` (`NODE_DATA_DIR`).
+
+Sin plataforma, para simular varias cámaras con videos:
+
+```json
+{
+  "services": {"spacesEnabled": true, "platesEnabled": false},
+  "cameras": [
+    {"id": 101, "name": "Simulada 1", "type": "OCCUPANCY", "sourceUrl": "videos/parking_simulacion.mp4"},
+    {"id": 102, "name": "Entrada", "type": "ENTRY", "sourceUrl": "videos/placas.mp4", "parkingId": 4}
+  ]
+}
+```
+
+```
+NODE_CAMERAS_FILE=camaras.json
+```
+
+Ajustes por cámara (desde la plataforma o el archivo): `analysisSeconds` (por defecto 3 s en
+ocupación y 0,5 s en entradas) y `tileGrid` (recortes por lado al analizar). Sin GPU no se
+recorta por defecto: medido con 6 cámaras en un PC sin GPU, con recortes 2×2 el modelo no
+alcanzaba (un análisis cada 6,4 s y la cuenta oscilaba entre 23 y 30), y sin recortes cada
+cámara se analizaba cada 3 s con el modelo al 45 % y la ocupación estable en 28-29 (hay unos 28 carros). Con GPU
+(`cuda`), se usa `YOLO_TILE_GRID`. El video en vivo de cada cámara se publica a lo sumo a
+`STREAM_MAX_FPS` (10 en un nodo) y los cuadros de en medio no se convierten a imagen.
+
+Sin `NODE_CODE` ni `NODE_CAMERAS_FILE` el servicio es una sola cámara con lo que diga el `.env`,
+como siempre.
 
 ## Flujo
 

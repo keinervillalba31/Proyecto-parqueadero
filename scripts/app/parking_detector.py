@@ -66,6 +66,41 @@ def _drop_partial_boxes(
     return kept
 
 
+def best_device() -> str:
+    """"cuda" si hay una GPU NVIDIA usable; si no, "cpu"."""
+    try:
+        import torch
+
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
+
+
+class SharedModel:
+    """Un solo YOLO en memoria para todas las cámaras de un nodo.
+
+    YOLO no se puede llamar desde dos hilos a la vez, así que cada inferencia toma el
+    candado: las cámaras se turnan solas, sin cargar una copia del modelo por cámara.
+    """
+
+    def __init__(self, model_path: Path, device: str | None = None) -> None:
+        self.model = YOLO(str(model_path))
+        self.device = device or best_device()
+        self.lock = threading.Lock()
+        # Para el estado del nodo: cuántas inferencias y cuánto tiempo de modelo en total.
+        self.calls = 0
+        self.busy_seconds = 0.0
+
+    def __call__(self, source: np.ndarray, **options: Any) -> Any:
+        with self.lock:
+            started = time.perf_counter()
+            try:
+                return self.model(source, device=self.device, **options)
+            finally:
+                self.calls += 1
+                self.busy_seconds += time.perf_counter() - started
+
+
 class VehicleDetector:
     """Detecta vehículos con YOLO, analizando también recortes del cuadro."""
 
@@ -77,8 +112,10 @@ class VehicleDetector:
         tile_grid: int,
         minimum_box_area: int,
         minimum_motorcycle_area: int,
+        model: SharedModel | None = None,
     ) -> None:
-        self.model = YOLO(str(model_path))
+        # Con un modelo compartido (nodo con varias cámaras) no se carga otra copia.
+        self.model = model if model is not None else YOLO(str(model_path))
         self.confidence = confidence
         self.image_size = image_size
         self.tile_grid = max(tile_grid, 1)
@@ -167,9 +204,13 @@ class ParkingDetector:
         free_seconds: float = 0.0,
         clock: Callable[[], float] = time.monotonic,
         aligner: CellAligner | None = None,
+        model: SharedModel | None = None,
     ) -> None:
-        with cells_path.open("r", encoding="utf-8") as file:
-            parking_cells = json.load(file)
+        # Sin archivo de celdas locales (cámara de un nodo): empieza sin celdas y las trae la plataforma.
+        parking_cells = {}
+        if cells_path.exists():
+            with cells_path.open("r", encoding="utf-8") as file:
+                parking_cells = json.load(file)
 
         self.cells = {
             name: {
@@ -185,6 +226,7 @@ class ParkingDetector:
             tile_grid=tile_grid,
             minimum_box_area=minimum_box_area,
             minimum_motorcycle_area=minimum_motorcycle_area,
+            model=model,
         )
         # Vehículos del último cuadro, para recortarlos y leer sus placas.
         self.last_vehicles: list[Vehicle] = []

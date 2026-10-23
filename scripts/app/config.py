@@ -124,5 +124,24 @@ class Settings:
     backend_request_timeout_seconds: float = float(os.getenv("BACKEND_REQUEST_TIMEOUT_SECONDS", "5"))
     backend_students_cache_seconds: float = float(os.getenv("BACKEND_STUDENTS_CACHE_SECONDS", "300"))
 
+    # --- Nodo de visión: un solo proceso atiende varias cámaras ---
+    # Con NODE_CODE el servicio trabaja como nodo: le pregunta a la plataforma qué cámaras le tocan
+    # (Monitoreo > Nodos) y las atiende todas con un solo modelo. Sin él, es una sola cámara con lo
+    # que diga este archivo (VIDEO_SOURCE, BACKEND_CAMERA_ID...), como siempre.
+    node_code: str = os.getenv("NODE_CODE", "").strip()
+    # URL con la que la plataforma llega a este nodo (para ver el video y abrir el editor de celdas).
+    node_public_url: str = os.getenv("NODE_PUBLIC_URL", "").strip().rstrip("/")
+    # Para simular varias cámaras sin plataforma: un JSON con la lista de cámaras (ver README).
+    node_cameras_file: Path | None = project_path("NODE_CAMERAS_FILE", Path("")) if os.getenv("NODE_CAMERAS_FILE") else None
+    # Carpeta con lo que guarda cada cámara (celdas, referencia, interruptores): camaras/<id>/.
+    node_data_dir: Path = project_path("NODE_DATA_DIR", PROJECT_DIR / "camaras")
+    node_config_poll_seconds: float = float(os.getenv("NODE_CONFIG_POLL_SECONDS", "10"))
+    node_heartbeat_seconds: float = float(os.getenv("NODE_HEARTBEAT_SECONDS", "10"))
+    # Cada cuántos segundos se analiza un cuadro de cada cámara (0 = tan seguido como se pueda).
+    # La ocupación no necesita más de uno cada pocos segundos: la histéresis ya pide varios.
+    analysis_interval_seconds: float = float(os.getenv("ANALYSIS_INTERVAL_SECONDS", "0"))
+    # Cuadros por segundo máximos del video en vivo que se publica (0 = todos los de la fuente).
+    stream_max_fps: float = float(os.getenv("STREAM_MAX_FPS", "0"))
+
 
 settings = Settings()
