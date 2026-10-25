@@ -212,6 +212,24 @@ class BackendClient:
             )
         return response.json().get("data", {})
 
+    def report_heartbeat(self, camera_id: int, online: bool, stream_url: str | None = None) -> None:
+        """Le dice al backend si la cámara está transmitiendo (Monitoreo muestra En línea / Sin conexión).
+
+        `stream_url` es dónde está ahora el video de este servicio; el backend la guarda
+        como URL de la cámara, así Monitoreo la sigue aunque cambie la IP de este equipo.
+        """
+        body: dict[str, Any] = {"status": "ONLINE" if online else "OFFLINE"}
+        if stream_url:
+            body["streamUrl"] = stream_url
+        response = self._mutating_request(
+            "POST", f"/api/monitoring/cameras/{camera_id}/heartbeat", json=body
+        )
+        if response.status_code != 200:
+            raise BackendError(
+                f"El backend rechazó el estado de la cámara {camera_id} "
+                f"({response.status_code}): {response.text[:200]}"
+            )
+
     def report_layout(self, camera_id: int, version: str, cells: list[dict[str, Any]]) -> None:
         """Envía el plano de planta de los puestos de esta cámara (para el mapa 3D del estudiante)."""
         response = self._mutating_request(

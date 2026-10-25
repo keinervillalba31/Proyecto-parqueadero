@@ -79,8 +79,14 @@ class Settings:
     video_fallback: str = video_fallback_from_env()
     # Cada cuántos segundos se reintenta la cámara principal mientras se usa el respaldo.
     video_camera_retry_seconds: float = float(os.getenv("VIDEO_CAMERA_RETRY_SECONDS", "10"))
+    # Con `auto` como equipo en VIDEO_SOURCE, la cámara se busca en la red (ONVIF).
+    # Trozo del identificador de la cámara, por si en la red hay varias. Vacío = la primera que abra.
+    camera_discovery_id: str = os.getenv("CAMERA_DISCOVERY_ID", "")
     service_host: str = os.getenv("SERVICE_HOST", "0.0.0.0")
     service_port: int = int(os.getenv("SERVICE_PORT", "8000"))
+    # Dirección con la que los navegadores llegan a este servicio (se envía a Monitoreo).
+    # Vacío = la IP que tenga este equipo en la red en ese momento.
+    service_public_url: str = os.getenv("SERVICE_PUBLIC_URL", "").rstrip("/")
     # Dónde se guarda lo que el operador dejó encendido o apagado desde el panel.
     services_state_path: Path = project_path("SERVICES_STATE", PROJECT_DIR / "servicios_activos.json")
     roboflow_workspace: str = os.getenv("ROBOFLOW_WORKSPACE", "")
