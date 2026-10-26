@@ -24,6 +24,7 @@ def make_service(monkeypatch, available: set[str], fallback: str = "respaldo.mp4
         video_source="rtsp://camara",
         video_fallback=fallback,
         video_camera_retry_seconds=retry,
+        camera_discovery_id="",
     )
     service.state = RuntimeState(total_spaces=2)
     service.active_source = service.settings.video_source
@@ -32,6 +33,7 @@ def make_service(monkeypatch, available: set[str], fallback: str = "respaldo.mp4
     service.probe_lock = threading.Lock()
     service.probe_thread = None
     service.probed_capture = None
+    service.camera_host = None
 
     def fake_open(source: str) -> FakeCapture:
         if source not in available:

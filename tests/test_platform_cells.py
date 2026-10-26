@@ -237,3 +237,83 @@ def test_report_occupancy_raises_when_rejected(client):
 
     with pytest.raises(BackendError):
         backend.report_occupancy(3, {99: True})
+
+
+class HeartbeatBackend:
+    def __init__(self, error=None):
+        self.error = error
+        self.reports: list[tuple[int, bool]] = []
+        self.stream_urls: list[str | None] = []
+
+    def report_heartbeat(self, camera_id, online, stream_url=None):
+        if self.error:
+            raise self.error
+        self.reports.append((camera_id, online))
+        self.stream_urls.append(stream_url)
+
+
+def make_heartbeat_service(make_detector, backend, using_fallback=False) -> VideoService:
+    service = make_service(make_detector, backend)
+    service.settings = SimpleNamespace(backend_camera_id=1, service_public_url="", service_port=8000)
+    service.camera_host = None
+    service.using_fallback = using_fallback
+    service.latest_frame = frame(200, 100)
+    service.reported_online = None
+    return service
+
+
+def test_heartbeat_reports_online_while_the_main_camera_streams(make_detector):
+    backend = HeartbeatBackend()
+    service = make_heartbeat_service(make_detector, backend)
+
+    assert service._report_heartbeat() is True
+    assert service._report_heartbeat() is True    # se repite: el backend vence el aviso
+    assert backend.reports == [(1, True), (1, True)]
+    assert backend.stream_urls[0].startswith("http://") and backend.stream_urls[0].endswith(":8000/video/parqueadero")
+
+
+def test_stream_url_prefers_the_configured_public_address(make_detector):
+    service = make_heartbeat_service(make_detector, HeartbeatBackend())
+    service.settings.service_public_url = "https://parqueadero.ufpso.edu.co"
+
+    assert service.stream_url() == "https://parqueadero.ufpso.edu.co/video/parqueadero"
+
+
+def test_heartbeat_reports_offline_on_the_fallback_video_or_an_error(make_detector):
+    backend = HeartbeatBackend()
+    service = make_heartbeat_service(make_detector, backend, using_fallback=True)
+    assert service._report_heartbeat() is True
+
+    service.using_fallback = False
+    service.state.worker_error = "sin cuadros"
+    assert service._report_heartbeat() is True
+    assert backend.reports == [(1, False), (1, False)]
+
+
+def test_heartbeat_reports_offline_until_the_first_frame_arrives(make_detector):
+    backend = HeartbeatBackend()
+    service = make_heartbeat_service(make_detector, backend)
+    service.latest_frame = None
+
+    assert service._report_heartbeat() is True
+    assert backend.reports == [(1, False)]
+
+
+def test_heartbeat_survives_a_backend_error(make_detector):
+    service = make_heartbeat_service(make_detector, HeartbeatBackend(error=BackendError("caído")))
+
+    assert service._report_heartbeat() is False
+    assert service.reported_online is None
+
+
+def test_report_heartbeat_sends_the_status(client):
+    backend, session = client
+    session.script["/api/monitoring/cameras/3/heartbeat"] = FakeResponse(200, {"success": True, "data": {}})
+
+    backend.report_heartbeat(3, online=True, stream_url="http://10.0.0.5:8000/video/parqueadero")
+    backend.report_heartbeat(3, online=False)
+
+    sent = [call for call in session.calls if call[1].endswith("/heartbeat")]
+    assert [call[0] for call in sent] == ["POST", "POST"]
+    assert sent[0][2]["json"] == {"status": "ONLINE", "streamUrl": "http://10.0.0.5:8000/video/parqueadero"}
+    assert sent[1][2]["json"] == {"status": "OFFLINE"}

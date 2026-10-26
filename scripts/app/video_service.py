@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 
 from .backend_client import BackendClient, BackendError, PlateEntryResult
+from .camera_discovery import discover_cameras, lan_address, mask_credentials, uses_auto_host, with_host
 from .config import Settings
 from .parking_detector import ParkingDetector, SharedModel, VehicleDetector
 from .alignment import CellAligner
@@ -128,6 +129,8 @@ class VideoService:
         # Última ocupación que aceptó el backend (puesto_id -> ocupado) y cuándo.
         self.reported_occupancy: dict[int, bool] | None = None
         self.reported_at = 0.0
+        # Último estado de la cámara que aceptó el backend (True = en línea).
+        self.reported_online: bool | None = None
         self.detector_failed = False
         self.analysis_seconds = 0.0
         self.next_frame_at = 0.0
@@ -139,7 +142,9 @@ class VideoService:
         self.last_primary_attempt = 0.0
         self.probe_lock = threading.Lock()
         self.probe_thread: threading.Thread | None = None
-        self.probed_capture: cv2.VideoCapture | None = None
+        self.probed_capture: tuple[cv2.VideoCapture, str] | None = None
+        # IP donde se encontró la cámara la última vez (VIDEO_SOURCE con `auto`).
+        self.camera_host: str | None = None
 
     @staticmethod
     def _load_registered_vehicles(path: Path) -> dict[str, Any]:
@@ -276,7 +281,7 @@ class VideoService:
                 worker.join(timeout=2)
         with self.probe_lock:
             if self.probed_capture is not None:
-                self.probed_capture.release()
+                self.probed_capture[0].release()
                 self.probed_capture = None
 
     @staticmethod
@@ -292,31 +297,54 @@ class VideoService:
         fallback = self.settings.video_fallback
         return bool(fallback) and fallback != self.settings.video_source
 
+    def _open_primary(self) -> tuple[cv2.VideoCapture, str]:
+        """Abre la cámara principal y devuelve también la URL con la que abrió.
+
+        Si VIDEO_SOURCE tiene `auto` como equipo, busca la cámara en la red cada vez:
+        así sigue funcionando aunque cambie su IP o se lleve el equipo a otra red.
+        """
+        source = self.settings.video_source
+        if not uses_auto_host(source):
+            return self._open_capture(source), source
+        hosts = discover_cameras(self.settings.camera_discovery_id)
+        if self.camera_host in hosts:
+            hosts.remove(self.camera_host)
+            hosts.insert(0, self.camera_host)       # la de la última vez, primero
+        for host in hosts:
+            url = with_host(source, host)
+            try:
+                capture = self._open_capture(url)
+            except RuntimeError:
+                continue
+            self.camera_host = host
+            return capture, url
+        raise RuntimeError("No se encontró la cámara en la red")
+
     def _open_source(self) -> cv2.VideoCapture:
         """Abre la cámara principal; si no responde, el video de respaldo en bucle."""
         try:
-            capture = self._open_capture(self.settings.video_source)
+            capture, source = self._open_primary()
         except RuntimeError:
             if not self._use_fallback():
                 raise
             capture = self._open_capture(self.settings.video_fallback)
             self._set_source(self.settings.video_fallback, using_fallback=True)
             return capture
-        self._set_source(self.settings.video_source, using_fallback=False)
+        self._set_source(source, using_fallback=False)
         return capture
 
     def _set_source(self, origin: str, using_fallback: bool) -> None:
         if using_fallback:
             log.warning("Cámara principal no disponible; usando el video de respaldo en bucle: %s", origin)
         else:
-            log.info("Usando la fuente principal: %s", origin)
+            log.info("Usando la fuente principal: %s", mask_credentials(origin))
         self.active_source = origin
         self.using_fallback = using_fallback
         self.last_primary_attempt = time.monotonic()
         self.state.update_source(
             {
                 "modo": "respaldo" if using_fallback else "principal",
-                "origen": origin,
+                "origen": mask_credentials(origin),
                 "respaldo": self.settings.video_fallback or None,
             }
         )
@@ -331,13 +359,13 @@ class VideoService:
         en el hilo del video congelaría la reproducción del respaldo.
         """
         try:
-            capture = self._open_capture(self.settings.video_source)
+            opened = self._open_primary()
         except RuntimeError:
             return
         with self.probe_lock:
             if self.probed_capture is not None:
-                self.probed_capture.release()
-            self.probed_capture = capture
+                self.probed_capture[0].release()
+            self.probed_capture = opened
 
     def _maybe_switch_to_primary(self, capture: cv2.VideoCapture) -> cv2.VideoCapture:
         """Si la cámara principal ya responde, deja el respaldo y pasa a ella."""
@@ -348,8 +376,9 @@ class VideoService:
             ready, self.probed_capture = self.probed_capture, None
         if ready is not None:
             capture.release()
-            self._set_source(self.settings.video_source, using_fallback=False)
-            return ready
+            ready_capture, source = ready
+            self._set_source(source, using_fallback=False)
+            return ready_capture
 
         due = time.monotonic() - self.last_primary_attempt >= self.settings.video_camera_retry_seconds
         if due and (self.probe_thread is None or not self.probe_thread.is_alive()):
@@ -664,11 +693,44 @@ class VideoService:
         log.info("Plano del parqueadero enviado al backend: %d puestos", len(layout))
         return True
 
+    def _report_heartbeat(self) -> bool:
+        """Avisa al backend si la cámara principal está transmitiendo. True si se envió.
+
+        Se envía en cada vuelta (no solo al cambiar) porque el backend da la cámara
+        por desconectada si deja de recibir el aviso.
+        """
+        online = (
+            not self.using_fallback
+            and self.latest_frame is not None
+            and self.state.worker_error is None
+        )
+        try:
+            self.backend.report_heartbeat(self.settings.backend_camera_id, online, self.stream_url())
+        except BackendError as error:
+            log.warning("No se pudo enviar el estado de la cámara al backend: %s", error)
+            return False
+        if online != self.reported_online:
+            log.info("Estado de la cámara enviado al backend: %s", "en línea" if online else "sin conexión")
+        self.reported_online = online
+        return True
+
+    def stream_url(self) -> str:
+        """URL del video de la cámara del parqueadero tal como la abre un navegador de la red.
+
+        Se calcula cada vez: si este equipo cambia de IP o de red, Monitoreo recibe la nueva.
+        """
+        base = self.settings.service_public_url
+        if not base:
+            # La IP de la tarjeta que llega a la cámara: la misma red en la que están los navegadores.
+            base = f"http://{lan_address(self.camera_host or '8.8.8.8')}:{self.settings.service_port}"
+        return f"{base}/video/parqueadero"
+
     def _cells_loop(self) -> None:
-        """Revisa cada cierto tiempo si el administrador cambió las celdas."""
+        """Revisa cada cierto tiempo si el administrador cambió las celdas y avisa si la cámara transmite."""
         while self.running:
             self._refresh_cells()
             self._report_layout()
+            self._report_heartbeat()
             waited = 0.0
             while self.running and waited < self.settings.backend_cells_poll_seconds:
                 time.sleep(0.5)

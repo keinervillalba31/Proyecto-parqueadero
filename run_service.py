@@ -56,8 +56,9 @@ def main() -> None:
 
     # Se importa aquí porque carga YOLO: no hace falta si solo se iba a abrir el panel.
     from app.main import app
+    from app.camera_discovery import mask_credentials
 
-    print(f"Fuente de video: {settings.video_source}")
+    print(f"Fuente de video: {mask_credentials(settings.video_source)}")
     if settings.video_fallback:
         print(f"Respaldo en bucle: {settings.video_fallback}")
     print(f"Servicio en http://{settings.service_host}:{settings.service_port}")
