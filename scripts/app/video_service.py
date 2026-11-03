@@ -17,7 +17,7 @@ from .parking_detector import ParkingDetector, SharedModel, VehicleDetector
 from .alignment import CellAligner
 from .calibration import layout_from_rows
 from .parking_layout import build_layout
-from .plate_reader import PlateReader, vehicle_crops
+from .plate_reader import PlateReader, vehicle_crops_with_kinds
 from .state import RuntimeState
 
 log = logging.getLogger("parqueadero")
@@ -84,6 +84,9 @@ class VideoService:
             cooldown_seconds=settings.plate_cooldown_seconds,
             plate_pattern=settings.plate_pattern,
             request_timeout=settings.plate_ocr_timeout_seconds,
+            engine=settings.plate_engine,
+            local_detector=settings.plate_local_detector,
+            local_ocr=settings.plate_local_ocr,
         )
         self.state = RuntimeState(self.parking.total_spaces)
         spaces, plates = self._load_services(settings.services_state_path)
@@ -438,11 +441,11 @@ class VideoService:
                 plate: dict(data) for plate, data in self.reservations.items()
             }
 
-    def _plate_images(self, clean_frame: np.ndarray) -> list[np.ndarray]:
-        """Imágenes a enviar al OCR: un recorte por vehículo o el cuadro completo."""
+    def _plate_images(self, clean_frame: np.ndarray) -> list[tuple[np.ndarray, str | None]]:
+        """Imágenes a enviar al OCR, con su tipo de vehículo: un recorte por vehículo o el cuadro completo."""
         if not self.settings.plate_crop_vehicles:
-            return [clean_frame]
-        return vehicle_crops(
+            return [(clean_frame, None)]
+        return vehicle_crops_with_kinds(
             clean_frame,
             self.parking.last_vehicles,
             max_vehicles=self.settings.plate_max_vehicles,
@@ -585,19 +588,31 @@ class VideoService:
             }
         )
 
-    def _read_plate(self, images: list[np.ndarray]) -> None:
+    def _read_plate(self, images: list[tuple[np.ndarray, str | None]]) -> None:
         try:
             self.state.update_plate(
                 {"ultimo_intento": time.time(), "error": None, "estado": "leyendo"}
             )
             started = time.perf_counter()
-            plates = [plate for image in images for plate in self.plates.read_all(image)]
+            use_kind = self.settings.plate_use_vehicle_kind
+            plates = [
+                plate
+                for image, kind in images
+                for plate in self.plates.read_all(image, kind if use_kind else None)
+            ]
             log.info(
-                "Lectura de placas: %d imagen(es) en %.1f s -> %s",
+                "Lectura de placas (%s): %d imagen(es) en %.1f s -> %s",
+                self.plates.engine,
                 len(images),
                 time.perf_counter() - started,
                 ", ".join(plates) or "nada",
             )
+            # Cuántas lecturas hizo cada motor: en modo híbrido, cuántas llamadas a la API se ahorran.
+            self.state.update_plate({
+                "motor": self.plates.engine,
+                "lecturas_locales": self.plates.stats["local"],
+                "consultas_roboflow": self.plates.stats["roboflow"],
+            })
             if not self.plates_enabled:
                 # Se apagó mientras se leía: el resultado se descarta.
                 self.state.update_plate({"estado": "detenido"})
@@ -832,7 +847,7 @@ class VideoService:
         with self.plate_frame_lock:
             return self.latest_plate_frame_id, self.latest_plate_frame
 
-    def _plate_video_images(self, frame: np.ndarray) -> list[np.ndarray]:
+    def _plate_video_images(self, frame: np.ndarray) -> list[tuple[np.ndarray, str | None]]:
         """Recorta los vehículos de la cámara de placas, como `probar_placas.py`.
 
         Tiene su propio YOLO porque el del parqueadero lo usa otro hilo. Si no
@@ -840,7 +855,7 @@ class VideoService:
         Roboflow.
         """
         if not self.settings.plate_crop_vehicles:
-            return [frame]
+            return [(frame, None)]
         if self.plate_vehicle_detector is None:
             self.plate_vehicle_detector = VehicleDetector(
                 model_path=self.settings.model_path,
@@ -854,7 +869,7 @@ class VideoService:
                 minimum_motorcycle_area=self.settings.minimum_motorcycle_area,
                 model=self.shared_model,
             )
-        return vehicle_crops(
+        return vehicle_crops_with_kinds(
             frame,
             self.plate_vehicle_detector.detect(frame),
             max_vehicles=self.settings.plate_max_vehicles,

@@ -1,14 +1,14 @@
 # Sistema de parqueadero
 
 Detecta la ocupación de las celdas de un parqueadero con YOLO a partir de un video,
-lee las placas con Roboflow y asigna una celda libre a los vehículos registrados.
+lee las placas (con un lector local abierto o con Roboflow) y asigna una celda libre a los vehículos registrados.
 
 ## Responsabilidades
 
 - `scripts/admin/configure_spaces.py`: el administrador marca las cuatro esquinas de cada celda y se guarda `estacionamientos.json`.
 - `scripts/admin/probar_placas.py`: prueba solo el lector de placas con un video o una imagen.
 - `scripts/app/parking_detector.py`: usa YOLO para detectar vehículos y marcar las celdas ocupadas o libres, con suavizado entre cuadros.
-- `scripts/app/plate_reader.py`: envía capturas a Roboflow y confirma la placa con varias lecturas.
+- `scripts/app/plate_reader.py`: lee las placas con el motor elegido (`PLATE_ENGINE`: local, Roboflow o híbrido) y confirma la placa con varias lecturas.
 - `scripts/app/video_service.py`: coordina el video, el detector, el lector de placas y las reservas de celdas.
 - `scripts/app/backend_client.py`: cuando una placa registrada se confirma, le pide a `educore-backend` que asigne y guarde el puesto (ver "Sincronización con el backend").
 - `scripts/app/main.py`: expone la API con FastAPI.
@@ -22,7 +22,32 @@ Requiere **Python 3.12** (`inference-sdk` todavía no es compatible con versione
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-copy .env.example .env   # y completar ROBOFLOW_API_KEY, ROBOFLOW_WORKSPACE, ROBOFLOW_WORKFLOW
+pip install --no-deps -r requirements-placas.txt   # lector de placas local (ver abajo)
+copy .env.example .env   # Roboflow es opcional: solo para PLATE_ENGINE=roboflow o hibrido
+```
+
+### Lector de placas local (sin API)
+
+Por defecto (`PLATE_ENGINE=local`) las placas se leen **solo en este equipo** con FastALPR
+(licencia MIT): un YOLOv9 que encuentra la placa y un OCR entrenado solo con placas, ambos en
+ONNX para CPU (~90 ms por recorte). Los modelos (~28 MB) se descargan la primera vez y luego
+no hace falta internet ni créditos.
+
+Con `PLATE_ENGINE=hibrido`, Roboflow se consulta solo si el detector local ve una placa y no
+logra leerla, y solo si hay credenciales; si falla o se acaban los créditos, sigue en local.
+`PLATE_ENGINE=roboflow` usa solo la API, como antes. El panel muestra cuántas lecturas fueron
+locales y cuántas consultas se hicieron a Roboflow.
+
+`requirements-placas.txt` se instala con `--no-deps` porque FastALPR pide
+`opencv-python-headless`, que choca con el `opencv-python` del servicio (traen el mismo `cv2`).
+
+Además, con el tipo de vehículo de YOLO se sabe qué formato esperar (carro `ABC123`, moto
+`ABC12D`): así `YZA916` leída en una moto se corrige a `YZA91G`.
+
+Para medir la exactitud con una grabación propia:
+
+```powershell
+python scripts/admin/probar_placas.py videos/video-placa.mp4 --placa-real YZA91G
 ```
 
 Todas las rutas relativas del `.env` se toman desde la raíz del proyecto.
@@ -89,7 +114,7 @@ celdas y la última placa, y tiene un interruptor para cada cosa:
 
 - **Espacios**: detección de celdas libres y ocupadas. Apagado, se conservan los últimos
   datos y deja de enviarse la ocupación al backend.
-- **Placas**: lectura de placas. Apagado, no se hacen consultas a Roboflow.
+- **Placas**: lectura de placas. Apagado, no se lee ninguna placa (ni local ni en Roboflow).
 
 **Desde la plataforma.** Con `BACKEND_SYNC_ENABLED=true`, los mismos dos interruptores están
 en la página **Monitoreo** (los puede mover quien tenga el permiso `MONITORING_MANAGE`). El
@@ -251,7 +276,7 @@ como siempre.
    `OCCUPANCY_OCCUPY_SECONDS` segundos seguidos viendo el vehículo, y a libre tras
    `OCCUPANCY_FREE_SECONDS` sin verlo (más tiempo, porque YOLO pierde a ratos los carros lejanos).
 3. Cuando hay un vehículo, cada `PLATE_INTERVAL_FRAMES` cuadros se recortan los vehículos
-   más cercanos que no estén estacionados y se envían a Roboflow.
+   más cercanos que no estén estacionados y se leen con el motor de `PLATE_ENGINE`.
    - Se descarta el texto que no tenga formato de placa (`PLATE_PATTERN`) y se corrigen
      confusiones típicas del OCR (O/0, I/1, B/8, S/5...).
    - La placa se confirma con `PLATE_CONFIRMATION_READS` lecturas parecidas: las que

@@ -4,7 +4,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from .plate_reader import DEFAULT_PLATE_PATTERN
+from .plate_reader import DEFAULT_LOCAL_DETECTOR, DEFAULT_LOCAL_OCR, DEFAULT_PLATE_PATTERN
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
@@ -63,6 +63,13 @@ class Settings:
     )
     minimum_box_area: int = int(os.getenv("MIN_BOX_AREA", "500"))
     minimum_motorcycle_area: int = int(os.getenv("MIN_MOTORCYCLE_AREA", "100"))
+    # Motor de lectura de placas: "local" (modelos abiertos, sin créditos), "roboflow" (API)
+    # o "hibrido" (local y Roboflow solo cuando el local ve una placa y no la logra leer).
+    plate_engine: str = os.getenv("PLATE_ENGINE", "local").strip().lower()
+    plate_local_detector: str = os.getenv("PLATE_LOCAL_DETECTOR", DEFAULT_LOCAL_DETECTOR)
+    plate_local_ocr: str = os.getenv("PLATE_LOCAL_OCR", DEFAULT_LOCAL_OCR)
+    # Usar el tipo de vehículo de YOLO (carro o moto) para saber qué formato de placa esperar.
+    plate_use_vehicle_kind: bool = os.getenv("PLATE_USE_VEHICLE_KIND", "true").lower() == "true"
     plate_interval_frames: int = int(os.getenv("PLATE_INTERVAL_FRAMES", "15"))
     plate_confirmation_reads: int = int(os.getenv("PLATE_CONFIRMATION_READS", "2"))
     plate_cooldown_seconds: float = float(os.getenv("PLATE_COOLDOWN_SECONDS", "30"))

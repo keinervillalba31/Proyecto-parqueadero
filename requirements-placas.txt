@@ -1,0 +1,12 @@
+# Lector de placas local (FastALPR: detector YOLOv9 de placas + OCR de placas, licencia MIT).
+# Corre en CPU, sin internet ni créditos. Los modelos (~28 MB) se descargan la primera vez.
+#
+# Se instala SIN dependencias para no reemplazar opencv-python por opencv-python-headless
+# (los dos traen el mismo módulo cv2 y chocan). Sus otras dependencias están en requirements.txt.
+#
+#   pip install --no-deps -r requirements-placas.txt
+#
+# pip avisará que falta opencv-python-headless: es esperado, opencv-python cumple esa función.
+fast-alpr==0.4.0
+fast-plate-ocr==1.1.0
+open-image-models==0.6.0

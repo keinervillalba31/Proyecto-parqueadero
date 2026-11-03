@@ -24,7 +24,7 @@ class FakeClient:
 
 def test_read_gives_up_when_roboflow_does_not_answer():
     # Una petición colgada no puede detener la lectura de placas para siempre.
-    reader = make_reader(request_timeout=0.2)
+    reader = make_reader(request_timeout=0.2, engine="roboflow")
     hanging = threading.Event()
     reader._cached_client = FakeClient(block=hanging)
     started = time.monotonic()
@@ -35,7 +35,7 @@ def test_read_gives_up_when_roboflow_does_not_answer():
 
 
 def test_read_returns_plates_when_roboflow_answers_in_time():
-    reader = make_reader(request_timeout=5)
+    reader = make_reader(request_timeout=5, engine="roboflow")
     reader._cached_client = FakeClient(result=[{"plate_text": ["ABC123"]}])
     assert reader.read_all(np.zeros((40, 40, 3), dtype=np.uint8)) == ["ABC123"]
 
