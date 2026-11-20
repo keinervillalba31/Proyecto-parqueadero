@@ -55,6 +55,11 @@ class Settings:
     yolo_confidence: float = float(os.getenv("YOLO_CONFIDENCE", "0.15"))
     yolo_image_size: int = int(os.getenv("YOLO_IMAGE_SIZE", "960"))
     yolo_tile_grid: int = int(os.getenv("YOLO_TILE_GRID", "2"))
+    # Detección automática de puestos (el editor la inicia): modelo de segmentación, tamaño de
+    # imagen (más grande ve los carros lejanos) y minutos quieto para que un vehículo marque un puesto.
+    cell_detection_model_path: Path = project_path("CELL_DETECTION_MODEL", SCRIPT_DIR / "yolo11n-seg.pt")
+    cell_detection_image_size: int = int(os.getenv("CELL_DETECTION_IMAGE_SIZE", "1600"))
+    cell_detection_dwell_minutes: float = float(os.getenv("CELL_DETECTION_DWELL_MINUTES", "3"))
     # Segundos seguidos viendo un vehículo para dar un puesto por ocupado, y sin verlo para darlo por libre.
     occupancy_occupy_seconds: float = float(os.getenv("OCCUPANCY_OCCUPY_SECONDS", "2"))
     occupancy_free_seconds: float = float(os.getenv("OCCUPANCY_FREE_SECONDS", "8"))

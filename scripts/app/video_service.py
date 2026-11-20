@@ -15,6 +15,7 @@ from .camera_discovery import discover_cameras, lan_address, mask_credentials, u
 from .config import Settings
 from .parking_detector import ParkingDetector, SharedModel, VehicleDetector
 from .alignment import CellAligner
+from .cell_detection import CellDetection
 from .calibration import layout_from_rows
 from .parking_layout import build_layout
 from .plate_reader import PlateReader, vehicle_crops_with_kinds
@@ -148,6 +149,17 @@ class VideoService:
         self.probed_capture: tuple[cv2.VideoCapture, str] | None = None
         # IP donde se encontró la cámara la última vez (VIDEO_SOURCE con `auto`).
         self.camera_host: str | None = None
+        # Detección automática de puestos, que inicia el editor de celdas. La propuesta queda en las
+        # coordenadas de la referencia de las celdas actuales, si la hay.
+        aligner = self.parking.aligner
+        self.cell_detection = CellDetection(
+            frame_source=self.clean_frame,
+            reference_source=aligner.reference_frame if aligner is not None else (lambda: None),
+            model_path=settings.cell_detection_model_path,
+            image_size=settings.cell_detection_image_size,
+            confidence=settings.yolo_confidence,
+            dwell_minutes=settings.cell_detection_dwell_minutes,
+        )
 
     @staticmethod
     def _load_registered_vehicles(path: Path) -> dict[str, Any]:

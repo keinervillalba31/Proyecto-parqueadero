@@ -321,6 +321,51 @@ cámara; con dos o más (`verificada: true`) una fila con error alto indica esqu
 o una cantidad de puestos equivocada. El plano queda como se vería la cámara desde arriba: lo
 cercano a la cámara abajo.
 
+## Detección automática de puestos (prototipo)
+
+En vez de trazar las celdas, el sistema las propone observando **dónde se estacionan los
+vehículos**; no depende de que las líneas pintadas se vean bien. Cada celda sale marcada como
+*observada* (hubo un vehículo quieto en ella) o *deducida* (hueco entre carros de una fila, o la
+fila de enfrente de una fila doble), para revisar primero las deducidas.
+
+```powershell
+python scripts/admin/detectar_puestos.py grabacion.mp4 --cada-segundos 5
+# medir contra celdas trazadas a mano sobre el mismo cuadro:
+python scripts/admin/detectar_puestos.py videos/parking_simulacion.mp4 --imagen-referencia referencia_celdas.jpg --referencia celdas.json
+# parqueaderos simulados desde varias cámaras:
+python scripts/admin/simular_puestos.py
+```
+
+Cómo funciona (`scripts/app/auto_cells.py`): siluetas de vehículos con `yolo11n-seg`, llevadas
+al cuadro de referencia; los vehículos quietos se agrupan en filas rectas; de las filas salen
+los dos puntos de fuga del suelo (filas y separadores, suponiendo la cámara sin ladear); a lo
+largo de cada fila los puestos se reparten con paso constante en escala proyectiva, así un
+hueco de dos pasos es un puesto vacío. Una fila que da celdas imposibles se descarta y sus
+carros reciben una celda cada uno.
+
+Para que encuentre los puestos vacíos conviene observar **horas con movimiento** (sirve un
+timelapse de una foto cada 5-10 s): un puesto que nadie usa durante la observación solo se
+deduce si queda entre carros o frente a una fila ocupada.
+
+**Desde la plataforma.** En el editor de celdas (Monitoreo → ▦ Celdas), el bloque *Detectar
+puestos automáticamente* elige cuánto observar (5 min de prueba a 4 h) y lo inicia en el
+servicio de la cámara; el editor se puede cerrar mientras tanto. Al terminar, *Cargar en el
+editor* reemplaza las celdas por las propuestas (las deducidas, punteadas en violeta), sobre la
+misma imagen en que se calcularon, y se vinculan solas a los puestos libres del parqueadero.
+Nada se guarda hasta pulsar *Guardar celdas*. El servicio analiza un cuadro cada 5 s; un puesto
+cuenta si un vehículo estuvo quieto en él `CELL_DETECTION_DWELL_MINUTES` (3 por defecto).
+
+| Ruta | Para qué |
+|---|---|
+| `GET /celdas/deteccion` | Estado (`inactiva`, `observando`, `calculando`, `lista`, `error`) y la propuesta |
+| `POST /celdas/deteccion` | Empieza: `{"minutos": 60, "cada_segundos": 5}` |
+| `POST /celdas/deteccion/terminar` | Deja de observar y calcula con lo visto |
+| `POST /celdas/deteccion/descartar` | Cancela o borra la propuesta |
+| `GET /celdas/deteccion/referencia` | Imagen a la que están referidas las celdas propuestas |
+
+Todas existen también como `/camaras/{id}/...`. La observación vive en memoria: si el
+servicio se reinicia, se pierde.
+
 ## Sincronización con el backend
 
 Además de la reserva local (en memoria, para la vista en vivo), el servicio le

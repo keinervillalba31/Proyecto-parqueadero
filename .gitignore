@@ -11,3 +11,11 @@ servicio.log
 
 # Cuadro de referencia de las celdas (lo guarda el servicio)
 referencia_celdas.jpg
+
+# Salidas pesadas de la deteccion automatica de puestos
+salida_puestos_largo/
+servicio_consola.log
+videos/
+*.pt
+evaluacion/**/*.png
+evaluacion/**/*.jpg

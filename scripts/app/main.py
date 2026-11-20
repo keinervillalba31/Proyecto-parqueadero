@@ -239,6 +239,70 @@ def cells_reference_image(camera_id: int | None = None) -> Response:
     )
 
 
+class CellDetectionIn(BaseModel):
+    """Cuánto observar y cada cuánto analizar un cuadro."""
+
+    minutos: float = Field(default=60.0, gt=0, le=12 * 60)
+    cada_segundos: float = Field(default=5.0, ge=1.0, le=600.0)
+
+
+@app.get("/celdas/deteccion")
+@app.get("/camaras/{camera_id}/celdas/deteccion")
+def cell_detection_status(camera_id: int | None = None) -> dict[str, Any]:
+    """En qué va la detección automática de puestos y, si terminó, las celdas que propone.
+
+    `estado`: inactiva, observando, calculando, lista o error. Las celdas de la propuesta son
+    relativas (0..1) al cuadro de /celdas/deteccion/referencia y dicen si se vio un vehículo en
+    ellas (`observada`) o se dedujeron.
+    """
+    return _camera(camera_id).cell_detection.status()
+
+
+@app.post("/celdas/deteccion")
+@app.post("/camaras/{camera_id}/celdas/deteccion")
+def start_cell_detection(request: CellDetectionIn, camera_id: int | None = None) -> dict[str, Any]:
+    """Empieza a observar la cámara para proponer sus celdas. No cambia las celdas actuales."""
+    detection = _camera(camera_id).cell_detection
+    try:
+        detection.start(request.minutos, request.cada_segundos)
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return detection.status()
+
+
+@app.post("/celdas/deteccion/terminar")
+@app.post("/camaras/{camera_id}/celdas/deteccion/terminar")
+def finish_cell_detection(camera_id: int | None = None) -> dict[str, Any]:
+    """Deja de observar ya y calcula la propuesta con lo visto hasta ahora."""
+    detection = _camera(camera_id).cell_detection
+    try:
+        detection.finish()
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return detection.status()
+
+
+@app.post("/celdas/deteccion/descartar")
+@app.post("/camaras/{camera_id}/celdas/deteccion/descartar")
+def discard_cell_detection(camera_id: int | None = None) -> dict[str, Any]:
+    """Cancela la observación en curso o borra la propuesta."""
+    detection = _camera(camera_id).cell_detection
+    detection.discard()
+    return detection.status()
+
+
+@app.get("/celdas/deteccion/referencia")
+@app.get("/camaras/{camera_id}/celdas/deteccion/referencia")
+def cell_detection_reference(camera_id: int | None = None) -> Response:
+    """El cuadro al que están referidas las celdas propuestas, para trazar sobre la misma imagen."""
+    image = _camera(camera_id).cell_detection.reference_jpeg()
+    if image is None:
+        raise HTTPException(status_code=404, detail="La detección todavía no tiene imagen")
+    return Response(content=image, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
 @app.get("/snapshot")
 @app.get("/camaras/{camera_id}/snapshot")
 def snapshot(camera_id: int | None = None) -> Response:
