@@ -13,24 +13,58 @@ import numpy as np
 from .backend_client import BackendClient, BackendError, PlateEntryResult
 from .camera_discovery import discover_cameras, lan_address, mask_credentials, uses_auto_host, with_host
 from .config import Settings
-from .parking_detector import ParkingDetector, VehicleDetector
+from .parking_detector import ParkingDetector, SharedModel, VehicleDetector
+from .alignment import CellAligner
+from .cell_detection import CellDetection
+from .calibration import layout_from_rows
 from .parking_layout import build_layout
-from .plate_reader import PlateReader, vehicle_crops
+from .plate_reader import PlateReader, vehicle_crops_with_kinds
 from .state import RuntimeState
 
 log = logging.getLogger("parqueadero")
 
 
+# Qué hace cada cámara: OCCUPANCY ve los puestos, ENTRY lee placas en una entrada y
+# MIXED hace las dos cosas (como la instalación de una sola cámara).
+ROLE_SPACES = {"OCCUPANCY", "MIXED"}
+ROLE_PLATES = {"ENTRY", "MIXED"}
+
+
 class VideoService:
+    """Lo que se hace con una cámara: leer su video, detectar, y reportar a la plataforma.
+
+    Sola, es todo el servicio (una cámara). En un nodo de visión hay una por cámara y
+    comparten el modelo, el cliente del backend y los interruptores de la plataforma.
+    """
+
     # Lo que el operador enciende o apaga desde el panel. El video sigue
     # transmitiéndose aunque los dos estén apagados.
     spaces_enabled = True
     plates_enabled = True
     backend: BackendClient | None = None
+    role = "MIXED"
+    manage_services = True
+    shared_model: SharedModel | None = None
+    last_published_at = 0.0
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        shared_model: SharedModel | None = None,
+        backend: BackendClient | None = None,
+        role: str = "MIXED",
+        manage_services: bool = True,
+    ) -> None:
         self.settings = settings
-        self.backend = BackendClient(settings) if settings.backend_sync_enabled else None
+        self.role = role if role in ROLE_SPACES | ROLE_PLATES else "MIXED"
+        # En un nodo, el nodo consulta los interruptores de la plataforma y los aplica a todas.
+        self.manage_services = manage_services
+        self.shared_model = shared_model
+        if backend is not None:
+            self.backend = backend
+        else:
+            self.backend = BackendClient(settings) if settings.backend_sync_enabled else None
         self.parking = ParkingDetector(
             cells_path=settings.cells_path,
             model_path=settings.model_path,
@@ -39,7 +73,10 @@ class VideoService:
             tile_grid=settings.yolo_tile_grid,
             minimum_box_area=settings.minimum_box_area,
             minimum_motorcycle_area=settings.minimum_motorcycle_area,
-            occupancy_frames=settings.occupancy_frames,
+            occupy_seconds=settings.occupancy_occupy_seconds,
+            free_seconds=settings.occupancy_free_seconds,
+            aligner=CellAligner(settings.cells_reference_path) if self.role in ROLE_SPACES else None,
+            model=shared_model,
         )
         self.plates = PlateReader(
             workspace=settings.roboflow_workspace,
@@ -48,11 +85,14 @@ class VideoService:
             cooldown_seconds=settings.plate_cooldown_seconds,
             plate_pattern=settings.plate_pattern,
             request_timeout=settings.plate_ocr_timeout_seconds,
+            engine=settings.plate_engine,
+            local_detector=settings.plate_local_detector,
+            local_ocr=settings.plate_local_ocr,
         )
         self.state = RuntimeState(self.parking.total_spaces)
-        self.spaces_enabled, self.plates_enabled = self._load_services(
-            settings.services_state_path
-        )
+        spaces, plates = self._load_services(settings.services_state_path)
+        self.spaces_enabled = spaces and self.role in ROLE_SPACES
+        self.plates_enabled = plates and self.role in ROLE_PLATES
         self.state.update_services(self.services())
         if not self.plates_enabled:
             self.state.update_plate({"estado": "detenido"})
@@ -86,6 +126,7 @@ class VideoService:
         self.cells_version: str | None = None
         # Celdas de la plataforma (relativas) y para cuáles ya se envió el plano de planta.
         self.platform_cells: dict[str, dict[str, Any]] = {}
+        self.platform_rows: list[Any] = []
         self.layout_reported_for: tuple[str | None, int, int] | None = None
         self.occupancy_thread: threading.Thread | None = None
         self.services_thread: threading.Thread | None = None
@@ -108,6 +149,17 @@ class VideoService:
         self.probed_capture: tuple[cv2.VideoCapture, str] | None = None
         # IP donde se encontró la cámara la última vez (VIDEO_SOURCE con `auto`).
         self.camera_host: str | None = None
+        # Detección automática de puestos, que inicia el editor de celdas. La propuesta queda en las
+        # coordenadas de la referencia de las celdas actuales, si la hay.
+        aligner = self.parking.aligner
+        self.cell_detection = CellDetection(
+            frame_source=self.clean_frame,
+            reference_source=aligner.reference_frame if aligner is not None else (lambda: None),
+            model_path=settings.cell_detection_model_path,
+            image_size=settings.cell_detection_image_size,
+            confidence=settings.yolo_confidence,
+            dwell_minutes=settings.cell_detection_dwell_minutes,
+        )
 
     @staticmethod
     def _load_registered_vehicles(path: Path) -> dict[str, Any]:
@@ -151,6 +203,11 @@ class VideoService:
 
         Se guarda en disco para que un reinicio del servicio respete lo que dejó el operador.
         """
+        # Lo que la cámara no hace por su tipo queda apagado aunque se pida encenderlo.
+        if spaces is not None:
+            spaces = spaces and self.role in ROLE_SPACES
+        if plates is not None:
+            plates = plates and self.role in ROLE_PLATES
         if (spaces is None or spaces == self.spaces_enabled) and (
             plates is None or plates == self.plates_enabled
         ):
@@ -201,12 +258,12 @@ class VideoService:
         if self.running:
             return
         self.running = True
-        if self.backend:
+        if self.backend and self.manage_services:
             self.services_thread = threading.Thread(
                 target=self._services_loop, name="services-sync", daemon=True
             )
             self.services_thread.start()
-        if self.backend and self.settings.backend_camera_id is not None:
+        if self.backend and self.settings.backend_camera_id is not None and self.role in ROLE_SPACES:
             self.cells_thread = threading.Thread(target=self._cells_loop, name="cells-sync", daemon=True)
             self.cells_thread.start()
             self.occupancy_thread = threading.Thread(
@@ -396,11 +453,11 @@ class VideoService:
                 plate: dict(data) for plate, data in self.reservations.items()
             }
 
-    def _plate_images(self, clean_frame: np.ndarray) -> list[np.ndarray]:
-        """Imágenes a enviar al OCR: un recorte por vehículo o el cuadro completo."""
+    def _plate_images(self, clean_frame: np.ndarray) -> list[tuple[np.ndarray, str | None]]:
+        """Imágenes a enviar al OCR, con su tipo de vehículo: un recorte por vehículo o el cuadro completo."""
         if not self.settings.plate_crop_vehicles:
-            return [clean_frame]
-        return vehicle_crops(
+            return [(clean_frame, None)]
+        return vehicle_crops_with_kinds(
             clean_frame,
             self.parking.last_vehicles,
             max_vehicles=self.settings.plate_max_vehicles,
@@ -432,9 +489,15 @@ class VideoService:
         worker.start()
         return worker
 
+    def _plate_entry(self, plate: str) -> PlateEntryResult:
+        """Placa confirmada al backend; en un nodo, con el parqueadero de esta cámara."""
+        if self.manage_services:
+            return self.backend.sync_plate_detection(plate)
+        return self.backend.sync_plate_detection(plate, parking_id=self.settings.backend_parking_id)
+
     def _sync_first_read(self, plate: str) -> None:
         try:
-            result = self.backend.sync_plate_detection(plate)
+            result = self._plate_entry(plate)
         except BackendError as error:
             log.warning("No se pudo consultar la placa %s en el backend: %s", plate, error)
             return
@@ -491,11 +554,11 @@ class VideoService:
         nunca debe detener la detección de video ni el reconocimiento de placas.
         """
         try:
-            result = self.backend.sync_plate_detection(plate)
+            result = self._plate_entry(plate)
             if result.outcome == "NOT_REGISTERED" and other_read and other_read != plate:
                 # Dos lecturas casi iguales (ABC128 y ABC123) se confirmaron entre sí:
                 # si el backend no conoce la elegida pero sí la otra, la otra es la real.
-                other = self.backend.sync_plate_detection(other_read)
+                other = self._plate_entry(other_read)
                 if other.outcome != "NOT_REGISTERED":
                     self.state.update_plate({"valor": other_read})
                     result = other
@@ -537,19 +600,31 @@ class VideoService:
             }
         )
 
-    def _read_plate(self, images: list[np.ndarray]) -> None:
+    def _read_plate(self, images: list[tuple[np.ndarray, str | None]]) -> None:
         try:
             self.state.update_plate(
                 {"ultimo_intento": time.time(), "error": None, "estado": "leyendo"}
             )
             started = time.perf_counter()
-            plates = [plate for image in images for plate in self.plates.read_all(image)]
+            use_kind = self.settings.plate_use_vehicle_kind
+            plates = [
+                plate
+                for image, kind in images
+                for plate in self.plates.read_all(image, kind if use_kind else None)
+            ]
             log.info(
-                "Lectura de placas: %d imagen(es) en %.1f s -> %s",
+                "Lectura de placas (%s): %d imagen(es) en %.1f s -> %s",
+                self.plates.engine,
                 len(images),
                 time.perf_counter() - started,
                 ", ".join(plates) or "nada",
             )
+            # Cuántas lecturas hizo cada motor: en modo híbrido, cuántas llamadas a la API se ahorran.
+            self.state.update_plate({
+                "motor": self.plates.engine,
+                "lecturas_locales": self.plates.stats["local"],
+                "consultas_roboflow": self.plates.stats["roboflow"],
+            })
             if not self.plates_enabled:
                 # Se apagó mientras se leía: el resultado se descarta.
                 self.state.update_plate({"estado": "detenido"})
@@ -597,6 +672,7 @@ class VideoService:
                 "points": cell["points"],
                 "puesto_id": cell.get("parkingSpaceId"),
                 "puesto": cell.get("parkingSpaceNumber"),
+                "fila": cell.get("row"),
             }
             for cell in data.get("cells", [])
         }
@@ -607,6 +683,7 @@ class VideoService:
 
         self.parking.set_relative_cells(cells)
         self.platform_cells = cells
+        self.platform_rows = data.get("rows") or []
         self.state.update_source({"celdas_origen": "plataforma", "celdas_version": version})
         log.info("Celdas actualizadas desde la plataforma: %d (versión %s)", len(cells), version)
         return True
@@ -626,7 +703,10 @@ class VideoService:
         if key == self.layout_reported_for:
             return False
         try:
-            layout = build_layout(self.platform_cells, width, height)
+            # Con filas del editor el plano sale de su calibración; sin ellas, del cálculo anterior.
+            layout = layout_from_rows(self.platform_cells, self.platform_rows)
+            if layout is None:
+                layout = build_layout(self.platform_cells, width, height)
         except ValueError as error:
             log.warning("No se pudo calcular el plano del parqueadero: %s", error)
             self.layout_reported_for = key        # no se reintenta hasta que cambien las celdas
@@ -749,11 +829,19 @@ class VideoService:
             time.sleep(wait)
         self.next_frame_at += interval
 
+    def _skip_frame(self) -> bool:
+        """Si el próximo cuadro llega antes de lo que permite STREAM_MAX_FPS, no hace falta convertirlo."""
+        max_fps = getattr(self.settings, "stream_max_fps", 0)
+        return max_fps > 0 and time.monotonic() - self.last_published_at < 1.0 / max_fps
+
     def _publish_frame(self, frame: np.ndarray) -> None:
         """Entrega el cuadro original al detector y al stream en vivo."""
         with self.frame_lock:
             self.latest_frame = frame
             self.latest_frame_id += 1
+        # Con muchas cámaras, convertir y codificar cada cuadro cuesta más que analizarlos: el
+        # video en vivo se publica a lo sumo a STREAM_MAX_FPS (ver _skip_frame).
+        self.last_published_at = time.monotonic()
         encoded_ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
         if encoded_ok:
             self.state.set_frame(encoded.tobytes())
@@ -771,7 +859,7 @@ class VideoService:
         with self.plate_frame_lock:
             return self.latest_plate_frame_id, self.latest_plate_frame
 
-    def _plate_video_images(self, frame: np.ndarray) -> list[np.ndarray]:
+    def _plate_video_images(self, frame: np.ndarray) -> list[tuple[np.ndarray, str | None]]:
         """Recorta los vehículos de la cámara de placas, como `probar_placas.py`.
 
         Tiene su propio YOLO porque el del parqueadero lo usa otro hilo. Si no
@@ -779,7 +867,7 @@ class VideoService:
         Roboflow.
         """
         if not self.settings.plate_crop_vehicles:
-            return [frame]
+            return [(frame, None)]
         if self.plate_vehicle_detector is None:
             self.plate_vehicle_detector = VehicleDetector(
                 model_path=self.settings.model_path,
@@ -791,8 +879,9 @@ class VideoService:
                 tile_grid=1,
                 minimum_box_area=self.settings.minimum_box_area,
                 minimum_motorcycle_area=self.settings.minimum_motorcycle_area,
+                model=self.shared_model,
             )
-        return vehicle_crops(
+        return vehicle_crops_with_kinds(
             frame,
             self.plate_vehicle_detector.detect(frame),
             max_vehicles=self.settings.plate_max_vehicles,
@@ -902,13 +991,19 @@ class VideoService:
                     interval = self._frame_interval(capture)
 
                 self._pace(interval)
-                ok, frame = capture.read()
+                # Con el video limitado a STREAM_MAX_FPS, los cuadros de en medio solo se toman
+                # (grab) sin convertirlos a imagen: es lo que más CPU ahorra con muchas cámaras.
+                skip = self._skip_frame()
+                ok, frame = (capture.grab(), None) if skip else capture.read()
                 if not ok and self._source_is_file():
                     # Un video de prueba terminó: se repite desde el inicio.
                     self.loop_count += 1
                     log.info("El video terminó; se repite desde el inicio (vuelta %d)", self.loop_count)
                     capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    ok, frame = capture.read()
+                    ok, frame = (capture.grab(), None) if skip else capture.read()
+                if ok and skip:
+                    self._count_video_frame()
+                    continue
                 if not ok:
                     capture.release()
                     capture = None
@@ -934,9 +1029,16 @@ class VideoService:
         en vez de acumularse; así el análisis nunca se atrasa respecto a la realidad.
         """
         last_id = 0
+        interval = getattr(self.settings, "analysis_interval_seconds", 0)
+        next_at = 0.0
         while self.running:
             if not self._detection_needed():
                 time.sleep(0.2)
+                continue
+            # Un análisis cada `interval` segundos: deja el modelo libre para las demás cámaras.
+            wait = next_at - time.monotonic()
+            if wait > 0:
+                time.sleep(min(wait, 0.2))
                 continue
             with self.frame_lock:
                 frame, frame_id = self.latest_frame, self.latest_frame_id
@@ -944,6 +1046,7 @@ class VideoService:
                 time.sleep(0.005)
                 continue
             last_id = frame_id
+            next_at = time.monotonic() + interval
             try:
                 self._process_detection(frame)
             except Exception as error:
@@ -953,6 +1056,7 @@ class VideoService:
 
     def _process_detection(self, frame: np.ndarray) -> None:
         started = time.perf_counter()
+        self.analysis_count = getattr(self, "analysis_count", 0) + 1
         self.frame_number += 1
         reserved = self.reserved_cells()
         parking_state, vehicles = self.parking.analyze(frame, reserved)
@@ -998,4 +1102,23 @@ class VideoService:
             "ok": self.state.worker_error is None,
             "error": self.state.worker_error or "",
             "fuente": "respaldo" if self.using_fallback else "principal",
+        }
+
+    def summary(self) -> dict[str, Any]:
+        """Lo que el nodo informa de esta cámara a la plataforma."""
+        current = self.state.snapshot()
+        performance = current.get("rendimiento", {})
+        return {
+            "id": self.settings.backend_camera_id,
+            "tipo": self.role,
+            "en_linea": self.clean_frame() is not None and self.state.worker_error is None,
+            "error": self.state.worker_error,
+            "fps_video": performance.get("fps_video"),
+            "fps_analisis": performance.get("fps_analisis"),
+            "espacios": self.spaces_enabled,
+            "placas": self.plates_enabled,
+            "analisis_hechos": getattr(self, "analysis_count", 0),
+            "ocupadas": current.get("ocupadas"),
+            "total_celdas": current.get("total_celdas"),
+            "alineacion": self.parking.aligner.health() if self.parking.aligner is not None else None,
         }

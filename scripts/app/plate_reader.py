@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import itertools
+import logging
 import os
 import re
 import tempfile
 import threading
 import time
 from collections import Counter, deque
+from dataclasses import dataclass
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Iterable
@@ -15,8 +17,20 @@ import cv2
 import numpy as np
 
 
+log = logging.getLogger(__name__)
+
 # Colombia: carros ABC123, motos ABC12D.
 DEFAULT_PLATE_PATTERN = r"^([A-Z]{3}[0-9]{3}|[A-Z]{3}[0-9]{2}[A-Z])$"
+# Con el tipo de vehículo que dio YOLO se sabe cuál de los dos formatos esperar: así
+# "YZA916" en una moto se corrige a "YZA91G" (el OCR confunde la G final con un 6).
+KIND_PATTERNS = {"carro": re.compile(r"^[A-Z]{3}[0-9]{3}$"), "moto": re.compile(r"^[A-Z]{3}[0-9]{2}[A-Z]$")}
+MOTORCYCLE_CLASS_ID = 3
+
+# Motores de lectura: "local" (modelos abiertos en este equipo, sin créditos),
+# "roboflow" (API externa) e "hibrido" (local y, solo si no logra leer, Roboflow).
+ENGINES = ("local", "roboflow", "hibrido")
+DEFAULT_LOCAL_DETECTOR = "yolo-v9-t-640-license-plate-end2end"
+DEFAULT_LOCAL_OCR = "cct-xs-v2-global-model"
 
 # Caracteres que el OCR suele confundir entre letra y número.
 LETTER_TO_DIGIT = {"O": "0", "Q": "0", "D": "0", "I": "1", "L": "1", "Z": "2",
@@ -47,6 +61,11 @@ def similar(first: str, second: str) -> bool:
     return edit_distance(first, second) <= 1
 
 
+def vehicle_kind(vehicle: Any) -> str:
+    """Formato de placa que se espera según la clase de YOLO del vehículo."""
+    return "moto" if getattr(vehicle, "class_id", None) == MOTORCYCLE_CLASS_ID else "carro"
+
+
 def vehicle_crops(
     frame: np.ndarray,
     vehicles: Iterable[Any],
@@ -60,6 +79,18 @@ def vehicle_crops(
     Enviar el recorte en vez del cuadro completo hace que la placa llegue más
     grande al OCR y sin letreros ni otras placas alrededor.
     """
+    return [crop for crop, _ in vehicle_crops_with_kinds(frame, vehicles, max_vehicles, minimum_width, skip_parked, margin)]
+
+
+def vehicle_crops_with_kinds(
+    frame: np.ndarray,
+    vehicles: Iterable[Any],
+    max_vehicles: int,
+    minimum_width: int,
+    skip_parked: bool = False,
+    margin: float = 0.1,
+) -> list[tuple[np.ndarray, str]]:
+    """Como `vehicle_crops`, pero cada recorte va con el tipo de vehículo ("carro" o "moto")."""
     height, width = frame.shape[:2]
     selected = [
         vehicle
@@ -74,13 +105,66 @@ def vehicle_crops(
         x1, y1, x2, y2 = vehicle.box
         pad_x = int((x2 - x1) * margin)
         pad_y = int((y2 - y1) * margin)
-        crops.append(
+        crops.append((
             frame[
                 max(y1 - pad_y, 0) : min(y2 + pad_y, height),
                 max(x1 - pad_x, 0) : min(x2 + pad_x, width),
-            ].copy()
-        )
+            ].copy(),
+            vehicle_kind(vehicle),
+        ))
     return crops
+
+
+def normalize_text(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.upper().strip()
+    value = re.sub(r"[^A-Z0-9]", "", value)
+    return value or None
+
+
+@dataclass
+class LocalRead:
+    """Lo que dio el lector local: los textos leídos y cuántas placas vio el detector."""
+
+    texts: list[str]
+    found: int
+
+
+class LocalPlateEngine:
+    """Detector y OCR de placas abiertos que corren en este equipo, sin internet ni créditos.
+
+    Usa FastALPR (licencia MIT): un YOLOv9 entrenado para encontrar placas y un OCR
+    entrenado solo con placas (fast-plate-ocr), ambos en ONNX para CPU. Los modelos se
+    descargan la primera vez (unos 28 MB) y quedan en la caché del usuario.
+    """
+
+    def __init__(self, detector_model: str = DEFAULT_LOCAL_DETECTOR, ocr_model: str = DEFAULT_LOCAL_OCR) -> None:
+        self.detector_model = detector_model
+        self.ocr_model = ocr_model
+        self._alpr: Any = None
+        self._lock = threading.Lock()
+
+    def _load(self) -> Any:
+        if self._alpr is None:
+            try:
+                alpr_module = import_module("fast_alpr")
+            except ImportError as error:
+                raise RuntimeError(
+                    "fast-alpr no está instalado. Instálalo con: "
+                    "pip install --no-deps -r requirements-placas.txt"
+                ) from error
+            self._alpr = alpr_module.ALPR(
+                detector_model=self.detector_model, ocr_model=self.ocr_model, ocr_device="cpu"
+            )
+        return self._alpr
+
+    def read(self, image: np.ndarray) -> LocalRead:
+        # Una sola lectura a la vez: el hilo de placas y el endpoint de prueba comparten el modelo.
+        with self._lock:
+            results = self._load().predict(image)
+        texts = [text for text in (normalize_text(result.ocr.text) for result in results if result.ocr) if text]
+        return LocalRead(texts=texts, found=len(results))
 
 
 class PlateReader:
@@ -92,7 +176,17 @@ class PlateReader:
         cooldown_seconds: float,
         plate_pattern: str = DEFAULT_PLATE_PATTERN,
         request_timeout: float = 30.0,
+        engine: str = "local",
+        local_detector: str = DEFAULT_LOCAL_DETECTOR,
+        local_ocr: str = DEFAULT_LOCAL_OCR,
+        local_engine: Any = None,
     ) -> None:
+        if engine not in ENGINES:
+            raise ValueError(f"Motor de placas desconocido: {engine!r} (usa {', '.join(ENGINES)})")
+        self.engine = engine
+        self.local = local_engine or LocalPlateEngine(local_detector, local_ocr)
+        # Cuántas lecturas hizo cada motor: muestra cuántas llamadas a la API se ahorran.
+        self.stats: Counter[str] = Counter()
         self.workspace = workspace
         self.request_timeout = request_timeout
         self.workflow = workflow
@@ -109,17 +203,27 @@ class PlateReader:
 
     @staticmethod
     def normalize(value: Any) -> str | None:
-        if not isinstance(value, str):
-            return None
-        value = value.upper().strip()
-        value = re.sub(r"[^A-Z0-9]", "", value)
-        return value or None
+        return normalize_text(value)
 
-    def validate(self, text: str) -> str | None:
-        """Devuelve la placa si tiene el formato esperado, corrigiendo O/0, I/1, etc."""
+    def validate(self, text: str, kind: str | None = None) -> str | None:
+        """Devuelve la placa si tiene el formato esperado, corrigiendo O/0, I/1, etc.
+
+        Con `kind` ("carro" o "moto") y el formato colombiano, primero se intenta el
+        formato de ese vehículo cambiando a lo sumo un carácter; si no se puede, se
+        valida como cualquier placa.
+        """
         if self.pattern is None:
             return text
-        if self.pattern.fullmatch(text):
+        if kind in KIND_PATTERNS and self.pattern.pattern == DEFAULT_PLATE_PATTERN:
+            plate = self._correct(text, KIND_PATTERNS[kind], max_changes=1)
+            if plate:
+                return plate
+        return self._correct(text, self.pattern, max_changes=max(1, len(text) // 3))
+
+    @staticmethod
+    def _correct(text: str, pattern: re.Pattern[str], max_changes: int) -> str | None:
+        """La versión de `text` con ese formato que cambia menos caracteres confundibles."""
+        if pattern.fullmatch(text):
             return text
 
         options = []
@@ -129,9 +233,8 @@ class PlateReader:
         if sum(len(option) > 1 for option in options) > MAX_AMBIGUOUS_CHARACTERS:
             return None
 
-        # Se prefiere la corrección que cambia menos caracteres, y se permite
-        # cambiar como máximo un tercio para no convertir basura en una placa.
-        max_changes = max(1, len(text) // 3)
+        # Se prefiere la corrección que cambia menos caracteres, y se permite cambiar
+        # como máximo `max_changes` (un tercio, en general) para no convertir basura en una placa.
         candidates = sorted(
             (
                 (sum(a != b for a, b in zip(candidate, text)), candidate)
@@ -142,7 +245,7 @@ class PlateReader:
             (
                 candidate
                 for changes, candidate in candidates
-                if changes <= max_changes and self.pattern.fullmatch(candidate)
+                if changes <= max_changes and pattern.fullmatch(candidate)
             ),
             None,
         )
@@ -160,10 +263,10 @@ class PlateReader:
             values = [values]
         return [text for text in map(self.normalize, values) if text]
 
-    def valid_plates(self, texts: Iterable[str]) -> list[str]:
+    def valid_plates(self, texts: Iterable[str], kind: str | None = None) -> list[str]:
         plates = []
         for text in texts:
-            plate = self.validate(text)
+            plate = self.validate(text, kind)
             if plate and plate not in plates:
                 plates.append(plate)
         return plates
@@ -246,11 +349,38 @@ class PlateReader:
             raise outcome["error"]
         return outcome["result"]
 
-    def read_all(self, frame: np.ndarray) -> list[str]:
-        return self.valid_plates(self.read_texts(frame))
+    def roboflow_configured(self) -> bool:
+        return bool(self.workspace and self.workflow and os.getenv("ROBOFLOW_API_KEY"))
 
-    def read(self, frame: np.ndarray) -> str | None:
-        plates = self.read_all(frame)
+    def read_candidates(self, frame: np.ndarray, kind: str | None = None) -> tuple[list[str], str]:
+        """Textos leídos (válidos o no) y el motor que los dio ("local" o "roboflow").
+
+        En modo híbrido se consulta Roboflow solo si el detector local vio una placa pero
+        el OCR no dio ninguna válida: la confianza del OCR no sirve para decidirlo, porque
+        sus lecturas erradas también salen con confianza alta, y esas ya las filtra la
+        confirmación con varias lecturas.
+        """
+        if self.engine == "roboflow":
+            self.stats["roboflow"] += 1
+            return self.read_texts(frame), "roboflow"
+        local = self.local.read(frame)
+        self.stats["local"] += 1
+        if (self.engine == "local" or not local.found or self.valid_plates(local.texts, kind)
+                or not self.roboflow_configured()):
+            return local.texts, "local"
+        try:
+            texts = self.read_texts(frame)
+        except Exception as error:  # sin Roboflow, se sigue con lo que leyó el modelo local
+            log.warning("Roboflow no respondió en modo híbrido: %s", error)
+            return local.texts, "local"
+        self.stats["roboflow"] += 1
+        return texts, "roboflow"
+
+    def read_all(self, frame: np.ndarray, kind: str | None = None) -> list[str]:
+        return self.valid_plates(self.read_candidates(frame, kind)[0], kind)
+
+    def read(self, frame: np.ndarray, kind: str | None = None) -> str | None:
+        plates = self.read_all(frame, kind)
         return plates[0] if plates else None
 
     def confirm(self, plate: str) -> tuple[str, int] | None:
@@ -259,6 +389,11 @@ class PlateReader:
         Lecturas que difieren en un solo carácter (BRF509 y BRF508) cuentan
         como la misma placa, y se publica la versión más repetida. Las
         lecturas de otros vehículos se conservan para seguir confirmándolos.
+
+        Si hay un empate real (TZA91G y YZA91G, una vez cada una) se espera otra
+        lectura para desempatar, en vez de quedarse con la que llegó primero: si
+        esa era la errada, la espera de la placa confirmada bloquearía la correcta.
+        Tras 2 × `confirmation_reads` + 1 lecturas se confirma igual, para no esperar siempre.
         """
         with self._lock:
             if self.in_cooldown(plate):
@@ -271,10 +406,15 @@ class PlateReader:
             # La más repetida; en empate, la que se parece a más lecturas del grupo
             # (entre BRF50, RF509 y BRF509 se elige BRF509).
             counts = Counter(group)
-            confirmed = max(
-                counts,
-                key=lambda read: (counts[read], sum(similar(read, other) for other in group)),
-            )
+
+            def score(read: str) -> tuple[int, int]:
+                return counts[read], sum(similar(read, other) for other in group)
+
+            ranked = sorted(counts, key=score, reverse=True)
+            tied = len(ranked) > 1 and score(ranked[0]) == score(ranked[1])
+            if tied and len(group) < 2 * self.confirmation_reads + 1:
+                return None
+            confirmed = ranked[0]
             self._forget(plate)
             return confirmed, len(group)
 

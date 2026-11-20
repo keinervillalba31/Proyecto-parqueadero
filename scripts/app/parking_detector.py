@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,8 @@ import cv2
 import numpy as np
 from shapely.geometry import Point, Polygon
 from ultralytics import YOLO
+
+from .alignment import CellAligner
 
 
 VEHICLE_CLASSES = {2: "Carro", 3: "Moto", 5: "Bus", 7: "Camion"}
@@ -35,6 +38,69 @@ class Vehicle:
         return Point((x1 + x2) / 2, y2)
 
 
+# Una caja que queda casi entera dentro de otra más grande es el mismo vehículo.
+_CONTAINED_RATIO = 0.7
+
+
+def _drop_partial_boxes(
+    detections: list[tuple[int, float, tuple[int, int, int, int]]],
+) -> list[tuple[int, float, tuple[int, int, int, int]]]:
+    """Quita las cajas parciales de un vehículo que ya tiene su caja completa.
+
+    Cuando el borde de un recorte corta un carro, YOLO devuelve una caja con solo una parte;
+    se superpone poco con la caja completa, así que el NMS la deja pasar y su punto de apoyo
+    cae en el puesto vecino: el carro se cuenta dos veces.
+    """
+    def area(box: tuple[int, int, int, int]) -> int:
+        return max(0, box[2] - box[0]) * max(0, box[3] - box[1])
+
+    def contained(small: tuple[int, int, int, int], large: tuple[int, int, int, int]) -> float:
+        width = min(small[2], large[2]) - max(small[0], large[0])
+        height = min(small[3], large[3]) - max(small[1], large[1])
+        return max(0, width) * max(0, height) / max(area(small), 1)
+
+    kept: list[tuple[int, float, tuple[int, int, int, int]]] = []
+    for detection in sorted(detections, key=lambda item: area(item[2]), reverse=True):
+        if all(contained(detection[2], other[2]) <= _CONTAINED_RATIO for other in kept):
+            kept.append(detection)
+    return kept
+
+
+def best_device() -> str:
+    """"cuda" si hay una GPU NVIDIA usable; si no, "cpu"."""
+    try:
+        import torch
+
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
+
+
+class SharedModel:
+    """Un solo YOLO en memoria para todas las cámaras de un nodo.
+
+    YOLO no se puede llamar desde dos hilos a la vez, así que cada inferencia toma el
+    candado: las cámaras se turnan solas, sin cargar una copia del modelo por cámara.
+    """
+
+    def __init__(self, model_path: Path, device: str | None = None) -> None:
+        self.model = YOLO(str(model_path))
+        self.device = device or best_device()
+        self.lock = threading.Lock()
+        # Para el estado del nodo: cuántas inferencias y cuánto tiempo de modelo en total.
+        self.calls = 0
+        self.busy_seconds = 0.0
+
+    def __call__(self, source: np.ndarray, **options: Any) -> Any:
+        with self.lock:
+            started = time.perf_counter()
+            try:
+                return self.model(source, device=self.device, **options)
+            finally:
+                self.calls += 1
+                self.busy_seconds += time.perf_counter() - started
+
+
 class VehicleDetector:
     """Detecta vehículos con YOLO, analizando también recortes del cuadro."""
 
@@ -46,8 +112,10 @@ class VehicleDetector:
         tile_grid: int,
         minimum_box_area: int,
         minimum_motorcycle_area: int,
+        model: SharedModel | None = None,
     ) -> None:
-        self.model = YOLO(str(model_path))
+        # Con un modelo compartido (nodo con varias cámaras) no se carga otra copia.
+        self.model = model if model is not None else YOLO(str(model_path))
         self.confidence = confidence
         self.image_size = image_size
         self.tile_grid = max(tile_grid, 1)
@@ -112,7 +180,7 @@ class VehicleDetector:
             self.confidence,
             0.45,
         )
-        return [candidates[index] for index in np.array(kept).flatten()]
+        return _drop_partial_boxes([candidates[index] for index in np.array(kept).flatten()])
 
     def _tile_starts(self, length: int, tile_length: int) -> list[int]:
         """Reparte `tile_grid` recortes solapados a lo largo de un eje."""
@@ -132,10 +200,17 @@ class ParkingDetector:
         tile_grid: int,
         minimum_box_area: int,
         minimum_motorcycle_area: int,
-        occupancy_frames: int = 1,
+        occupy_seconds: float = 0.0,
+        free_seconds: float = 0.0,
+        clock: Callable[[], float] = time.monotonic,
+        aligner: CellAligner | None = None,
+        model: SharedModel | None = None,
     ) -> None:
-        with cells_path.open("r", encoding="utf-8") as file:
-            parking_cells = json.load(file)
+        # Sin archivo de celdas locales (cámara de un nodo): empieza sin celdas y las trae la plataforma.
+        parking_cells = {}
+        if cells_path.exists():
+            with cells_path.open("r", encoding="utf-8") as file:
+                parking_cells = json.load(file)
 
         self.cells = {
             name: {
@@ -151,14 +226,23 @@ class ParkingDetector:
             tile_grid=tile_grid,
             minimum_box_area=minimum_box_area,
             minimum_motorcycle_area=minimum_motorcycle_area,
+            model=model,
         )
         # Vehículos del último cuadro, para recortarlos y leer sus placas.
         self.last_vehicles: list[Vehicle] = []
-        # Un cambio de estado solo se acepta si se repite en varios cuadros
-        # seguidos; así una detección perdida no hace parpadear la celda.
-        self.occupancy_frames = max(occupancy_frames, 1)
+        # Un cambio de estado solo se acepta si se sostiene un tiempo: ocupar pide
+        # `occupy_seconds` viendo el vehículo y liberar `free_seconds` sin verlo.
+        # Liberar exige más porque YOLO pierde a ratos los carros lejanos o
+        # tapados, y un carro estacionado no se va en un segundo. Va por tiempo,
+        # no por cuadros, para que no dependa de lo rápido que analice el equipo.
+        self.occupy_seconds = max(occupy_seconds, 0.0)
+        self.free_seconds = max(free_seconds, 0.0)
+        self._clock = clock
+        # Si se da, las celdas siguen a la imagen cuando la cámara se corre.
+        self.aligner = aligner
         self.stable_occupied = {name: False for name in self.cells}
-        self.pending_frames = {name: 0 for name in self.cells}
+        # Desde cuándo una celda muestra lo contrario de su estado, sin interrupción.
+        self.pending_since: dict[str, float | None] = {name: None for name in self.cells}
         # Celdas traídas de la plataforma, en coordenadas relativas (0 a 1); se
         # convierten a píxeles según el tamaño real del video. nombre -> datos.
         self.cell_meta: dict[str, dict[str, Any]] = {}
@@ -183,6 +267,8 @@ class ParkingDetector:
         if incoming is not None:
             self._relative_cells = incoming
             self._scaled_size = None
+            if self.aligner is not None:
+                self.aligner.cells_changed()
         if self._relative_cells is None or self._scaled_size == (width, height):
             return
 
@@ -192,7 +278,7 @@ class ParkingDetector:
             cells[name] = {"points": np.array(points, dtype=np.int32), "polygon": Polygon(points)}
         # Las celdas que siguen existiendo conservan su estado ya suavizado.
         self.stable_occupied = {name: self.stable_occupied.get(name, False) for name in cells}
-        self.pending_frames = {name: self.pending_frames.get(name, 0) for name in cells}
+        self.pending_since = {name: self.pending_since.get(name) for name in cells}
         self.cell_meta = {
             name: {"puesto_id": data.get("puesto_id"), "puesto": data.get("puesto")}
             for name, data in self._relative_cells.items()
@@ -201,14 +287,18 @@ class ParkingDetector:
         self._scaled_size = (width, height)
 
     def _smooth(self, raw_occupied: dict[str, bool]) -> dict[str, bool]:
+        now = self._clock()
         for name, is_occupied in raw_occupied.items():
             if is_occupied == self.stable_occupied[name]:
-                self.pending_frames[name] = 0
+                # Basta un cuadro que confirme el estado para descartar el cambio pendiente.
+                self.pending_since[name] = None
                 continue
-            self.pending_frames[name] += 1
-            if self.pending_frames[name] >= self.occupancy_frames:
+            started = self.pending_since[name]
+            if started is None:
+                started = self.pending_since[name] = now
+            if now - started >= (self.occupy_seconds if is_occupied else self.free_seconds):
                 self.stable_occupied[name] = is_occupied
-                self.pending_frames[name] = 0
+                self.pending_since[name] = None
         return dict(self.stable_occupied)
 
     def detect(
@@ -247,6 +337,9 @@ class ParkingDetector:
             )
 
         cells_state = state.get("celdas", {})
+        # Las celdas se dibujan donde quedan en este cuadro, si la cámara se movió.
+        to_reference = self.aligner.last_transform if self.aligner is not None else None
+        to_frame = np.linalg.inv(to_reference) if to_reference is not None else None
         for name, cell in self.cells.items():
             if cells_state.get(name, {}).get("ocupado"):
                 color, status = (0, 0, 255), "Ocupado"
@@ -255,6 +348,9 @@ class ParkingDetector:
             else:
                 color, status = (0, 255, 0), "Libre"
             points = cell["points"]
+            if to_frame is not None:
+                points = cv2.perspectiveTransform(points.astype(np.float32).reshape(-1, 1, 2), to_frame)
+                points = np.round(points).astype(np.int32).reshape(-1, 2)
             cv2.polylines(frame, [points], True, color, 2)
             cv2.putText(
                 frame,
@@ -275,13 +371,22 @@ class ParkingDetector:
         self._apply_cell_changes(width, height)
         occupied = {name: False for name in self.cells}
         vehicles = self.vehicles.detect(frame)
+        # Las celdas están donde se trazaron: el punto de apoyo de cada vehículo se lleva allí.
+        to_reference = self.aligner.transform(frame) if self.aligner is not None else None
 
         for vehicle in vehicles:
+            foot = vehicle.footpoint
+            moved = foot
+            if to_reference is not None:
+                x, y = cv2.perspectiveTransform(np.float32([[[foot.x, foot.y]]]), to_reference)[0, 0]
+                moved = Point(float(x), float(y))
             for name, cell in self.cells.items():
-                if cell["polygon"].covers(vehicle.footpoint):
+                if cell["polygon"].covers(moved):
                     occupied[name] = True
                     vehicle.in_cell = True
 
+        if self.aligner is not None:
+            self.aligner.consider(frame, sum(occupied.values()))
         self.last_vehicles = vehicles
         occupied = self._smooth(occupied)
 
@@ -292,6 +397,12 @@ class ParkingDetector:
             "ocupadas": occupied_count,
             "libres": len(self.cells) - occupied_count,
             "vehiculos_detectados": len(vehicles),
+            "alineacion": {
+                "referencia": self.aligner.source if self.aligner is not None else "ninguna",
+                "compensando": to_reference is not None,
+                "dx": round(self.aligner.last_shift[0], 1) if self.aligner is not None else 0.0,
+                "dy": round(self.aligner.last_shift[1], 1) if self.aligner is not None else 0.0,
+            },
             "congestion_porcentaje": round(occupied_count / len(self.cells) * 100, 2)
             if self.cells
             else 0.0,

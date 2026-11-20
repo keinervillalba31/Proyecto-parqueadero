@@ -38,7 +38,8 @@ def make_detector(cells_path, monkeypatch):
 
     monkeypatch.setattr(parking_detector, "YOLO", lambda *args, **kwargs: None)
 
-    def factory(occupancy_frames: int = 1, tile_grid: int = 1):
+    def factory(occupy_seconds: float = 0.0, free_seconds: float = 0.0, clock=None, tile_grid: int = 1):
+        timing = {"clock": clock} if clock else {}
         return parking_detector.ParkingDetector(
             cells_path=cells_path,
             model_path=Path("modelo_falso.pt"),
@@ -47,7 +48,9 @@ def make_detector(cells_path, monkeypatch):
             tile_grid=tile_grid,
             minimum_box_area=500,
             minimum_motorcycle_area=100,
-            occupancy_frames=occupancy_frames,
+            occupy_seconds=occupy_seconds,
+            free_seconds=free_seconds,
+            **timing,
         )
 
     return factory

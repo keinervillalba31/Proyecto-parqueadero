@@ -19,6 +19,7 @@ plataforma, para que la calibración no dependa de la resolución.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import cv2
 import numpy as np
@@ -205,6 +206,12 @@ def calibrate(rows: list[Row], sizes: dict[str, tuple[float, float]] | None = No
     to_plan = _plan_frame(h, np.vstack(placed))
     homography = to_plan @ h @ _CENTER
     homography = homography / homography[2, 2]
+    # Escala con el signo que deja positiva la coordenada homogénea del suelo marcado: la
+    # esquina (0, 0) suele ser cielo, detrás del horizonte, y ahí quedaría negativa. Así,
+    # quien proyecte puntos puede descartar los de detrás de la cámara con w <= 0.
+    relative = np.vstack([np.asarray(row.corners, dtype=float) for row in rows])
+    if np.mean(relative @ homography[2, :2] + homography[2, 2]) < 0:
+        homography = -homography
     inverse = np.linalg.inv(homography)
 
     row_fits, cells = [], []
@@ -216,6 +223,96 @@ def calibrate(rows: list[Row], sizes: dict[str, tuple[float, float]] | None = No
             cells.append(Cell(stall.label, stall.type, row.label, apply(inverse, cell_ground), cell_ground))
     return Calibration(homography, tuple(row_fits), tuple(cells))
 
+
+
+def _rigid_fit(source: np.ndarray, target: np.ndarray) -> tuple[np.ndarray, float]:
+    """Giro y traslado que mejor llevan `source` sobre `target`, y la distancia media que queda."""
+    a, b = source - source.mean(axis=0), target - target.mean(axis=0)
+    u, _, vt = np.linalg.svd(a.T @ b)
+    rotation = (u @ vt).T
+    if np.linalg.det(rotation) < 0:            # sin reflejos: el suelo no se ve en espejo
+        vt[-1] *= -1
+        rotation = (u @ vt).T
+    moved = source @ rotation.T + (target.mean(axis=0) - source.mean(axis=0) @ rotation.T)
+    return rotation, float(np.mean(np.linalg.norm(moved - target, axis=1)))
+
+
+# Si al dejar fuera una esquina (o una fila) el resto encaja así de mejor, esa esquina (o fila) se tomó mal.
+_OUTLIER_GAIN = 3.0
+_OUTLIER_MIN_M = 0.15
+
+
+@dataclass(frozen=True)
+class Suggestion:
+    corners: np.ndarray          # (4, 2) dónde deberían ir las esquinas, en la imagen (relativas)
+    deviation_m: float           # cuánto se aleja lo marcado de eso, en la esquina más alejada
+
+
+def _suggest(row: Row, others: list[Row], sizes: dict[str, tuple[float, float]]) -> Suggestion | None:
+    """La fila ubicada según la calibración de las otras filas; None si no se puede."""
+    try:
+        reference = calibrate(others, sizes)
+    except ValueError:
+        return None
+    ideal, _ = _row_shape(row, sizes)
+    ground = apply(reference.homography, np.asarray(row.corners, dtype=float))
+    if not np.isfinite(ground).all():
+        return None
+    keep = np.arange(4)
+    _, full_error = _rigid_fit(ideal, ground)
+    if full_error > _OUTLIER_MIN_M:
+        best_error, worst_corner = min((_rigid_fit(ideal[np.delete(keep, i)], ground[np.delete(keep, i)])[1], i) for i in range(4))
+        if best_error * _OUTLIER_GAIN < full_error:
+            keep = np.delete(keep, worst_corner)
+    rotation, _ = _rigid_fit(ideal[keep], ground[keep])
+    fitted = ideal @ rotation.T + (ground[keep].mean(axis=0) - ideal[keep].mean(axis=0) @ rotation.T)
+    deviation = float(np.linalg.norm(fitted - ground, axis=1).max())
+    return Suggestion(reference.to_image(fitted), deviation)
+
+
+def suggested_corners(
+    rows: list[Row], sizes: dict[str, tuple[float, float]] | None = None,
+) -> dict[str, Suggestion]:
+    """Dónde deberían ir las esquinas de cada fila para encajar con las demás, en la imagen.
+
+    Cada fila se compara con la calibración de las otras filas, para que sus propios errores no
+    la deformen. Si una esquina no encaja con las otras tres (típico: una punta de la fila
+    marcada más larga), se ignora y la fila se ubica con las otras tres.
+    Hace falta al menos otra fila; las que no se pueden comparar no aparecen.
+    """
+    sizes = {**STALL_SIZES, **(sizes or {})}
+    if len(rows) < 2:
+        return {}
+
+    def against(reference: list[Row]) -> dict[str, Suggestion]:
+        found = {}
+        for index, row in enumerate(rows):
+            suggestion = _suggest(row, reference[:index] + reference[index + 1:], sizes)
+            if suggestion is not None:
+                found[row.label] = suggestion
+        return found
+
+    # Una fila mal marcada también descuadra la revisión de las demás: se corrige de a una, la que
+    # peor encaja primero, hasta que todas encajen. Así no se "corrigen" filas buenas.
+    reference = list(rows)
+    cleaned: set[str] = set()
+    for _ in range(len(rows) - 1):
+        found = against(reference)
+        pending = [label for label in found if label not in cleaned]
+        if not pending:
+            break
+        worst = max(pending, key=lambda label: found[label].deviation_m)
+        rest = [found[label].deviation_m for label in found if label != worst]
+        # Solo se corrige una fila que se sale del patrón de las demás. Si todas se desvían parecido, el
+        # problema no es una fila mal marcada (por ejemplo, puestos que no miden lo de siempre).
+        if found[worst].deviation_m <= max(_OUTLIER_MIN_M, _OUTLIER_GAIN * float(np.median(rest))):
+            return found
+        cleaned.add(worst)
+        reference = [
+            Row(row.label, found[worst].corners, row.stalls, row.angle) if row.label == worst else row
+            for row in reference
+        ]
+    return against(reference)
 
 def _plan_frame(h: np.ndarray, ground: np.ndarray) -> np.ndarray:
     """Giro y traslado del plano para verlo como desde la cámara, pero desde arriba.
@@ -237,13 +334,16 @@ def _plan_frame(h: np.ndarray, ground: np.ndarray) -> np.ndarray:
 def top_down(
     frame: np.ndarray,
     calibration: Calibration,
-    margin_m: float = 5.0,
-    max_side: int = 1400,
+    margin_m: float = 2.0,
+    max_side: int = 1600,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """La imagen de la cámara vista desde arriba, y la matriz metros -> píxeles de esa imagen.
+    """La imagen de la cámara vista desde arriba, como la de un dron, y la matriz metros -> píxeles.
 
-    Solo cubre las filas más un margen: más lejos el suelo se estira tanto que
-    deja de servir para editar.
+    Solo cubre las filas más un margen: más lejos el suelo se estira tanto que deja de
+    servir. Se limpia el grano del video sin borrar los bordes, y lo que la cámara no ve
+    se rellena con una continuación borrosa y oscura de la imagen en vez de un fondo gris.
+    Los objetos altos (carros, árboles) siguen viéndose inclinados: con una sola cámara de
+    lado no se sabe cómo son por arriba.
     """
     height, width = frame.shape[:2]
     corners = np.vstack([row.ground for row in calibration.rows])
@@ -256,8 +356,163 @@ def top_down(
     ])
     to_relative = np.diag([1.0 / width, 1.0 / height, 1.0])
     size = tuple(int(np.ceil(v)) for v in (high - low) * pixels_per_m)
-    image = cv2.warpPerspective(
-        frame, meters_to_pixels @ calibration.homography @ to_relative, size,
-        flags=cv2.INTER_LINEAR, borderValue=(40, 40, 40),
+    warp = meters_to_pixels @ calibration.homography @ to_relative
+    image = cv2.warpPerspective(frame, warp, size, flags=cv2.INTER_CUBIC, borderValue=(0, 0, 0))
+    seen = cv2.warpPerspective(np.full((height, width), 255, np.uint8), warp, size, flags=cv2.INTER_NEAREST)
+    # El borde de lo visto se mezcla con el negro de fuera al interpolar: se descarta.
+    seen = cv2.erode(seen, np.ones((5, 5), np.uint8))
+
+    image = _fill_unseen(image, seen > 0)
+    image = cv2.bilateralFilter(image, 7, 28, 5)
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV).astype(np.float32)
+    hsv[..., 1] = np.clip(hsv[..., 1] * 1.12, 0, 255)
+    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR), meters_to_pixels
+
+
+def _fill_unseen(image: np.ndarray, seen: np.ndarray) -> np.ndarray:
+    """Rellena lo que la cámara no ve prolongando, borroso y oscuro, el color de los bordes."""
+    if seen.all() or not seen.any():
+        return image
+    mask = seen.astype(np.float32)
+    # A un octavo del tamaño, cada vez más borroso, para que el relleno llegue lejos sin costar mucho.
+    small_image = cv2.resize(image.astype(np.float32) * mask[..., None], None, fx=0.125, fy=0.125, interpolation=cv2.INTER_AREA)
+    small_mask = cv2.resize(mask, None, fx=0.125, fy=0.125, interpolation=cv2.INTER_AREA)
+    for sigma in (3, 10, 27):
+        blurred = cv2.GaussianBlur(small_image, (0, 0), sigma)
+        weight = cv2.GaussianBlur(small_mask, (0, 0), sigma)
+        known = small_mask > 0.02
+        colors = np.where(known[..., None], small_image / np.maximum(small_mask, 1e-4)[..., None],
+                          blurred / np.maximum(weight, 1e-4)[..., None])
+        small_mask = np.maximum(small_mask, (weight > 1e-3).astype(np.float32))
+        small_image = colors * small_mask[..., None]
+    colors = small_image / np.maximum(small_mask, 1e-4)[..., None]
+    fill = cv2.resize(colors, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_CUBIC)
+    fill = cv2.GaussianBlur(fill, (0, 0), 6) * 0.55
+    # Transición suave solo hacia afuera: dentro de lo visto la imagen queda intacta.
+    alpha = np.maximum(mask, cv2.GaussianBlur(mask, (0, 0), 3))[..., None]
+    outside = np.where(seen[..., None], image.astype(np.float32), fill)
+    return np.clip(outside * alpha + fill * (1 - alpha), 0, 255).astype(np.uint8)
+
+
+# --- Plano de planta para el mapa 3D -------------------------------------------------------
+
+# Puestos extra por cada lado de una fila (motos al principio o al final), como en el editor.
+_MAX_ROW_MOTOS = 30
+
+
+def _editor_row(index: int, raw: Any) -> tuple[Row, dict[str, Any]] | None:
+    """Fila tal como la guarda el editor de la plataforma; None si no se puede usar.
+
+    El editor la guarda con: corners (4 esquinas relativas), type, count, angle y las
+    motos que la siguen por fuera de lo marcado (motosStart, motosEnd, motoWidth).
+    """
+    if not isinstance(raw, dict):
+        return None
+    corners = np.asarray(raw.get("corners"), dtype=float) if isinstance(raw.get("corners"), list) else None
+    count = raw.get("count")
+    if corners is None or corners.shape != (4, 2) or not isinstance(count, int) or count < 1:
+        return None
+    kind = "MOTORCYCLE" if raw.get("type") == "MOTORCYCLE" else "CAR"
+    angle = raw.get("angle") if isinstance(raw.get("angle"), (int, float)) else 90.0
+
+    def amount(key: str) -> int:
+        value = raw.get(key)
+        return int(value) if isinstance(value, (int, float)) and 0 <= value <= _MAX_ROW_MOTOS else 0
+
+    moto_width = raw.get("motoWidth")
+    extras = {
+        "type": kind,
+        "count": count,
+        "motos_start": amount("motosStart"),
+        "motos_end": amount("motosEnd"),
+        "moto_width": float(moto_width) if isinstance(moto_width, (int, float)) and 0.5 <= moto_width <= 3 else STALL_SIZES["MOTORCYCLE"][0],
+    }
+    row = Row(str(index), corners, tuple(Stall(f"{index}-{i}", kind) for i in range(count)), float(angle))
+    return row, extras
+
+
+def _row_stalls_ground(fit: RowFit, row: Row, extras: dict[str, Any]) -> list[np.ndarray]:
+    """Cada puesto de la fila en el plano, incluidas las motos de los extremos.
+
+    Se reparte igual que en el editor: a lo largo del frente, con el mismo fondo que la
+    fila. Así cada celda que generó el editor tiene aquí su puesto exacto.
+    """
+    width, length = STALL_SIZES[extras["type"]]
+    angle = np.radians(row.angle)
+    sin = np.sin(angle)
+    pitch, shift, depth = width / sin, length * np.cos(angle), length * sin
+    start = max(0.0, -shift)
+    total = start + extras["count"] * pitch + max(0.0, shift)
+    g0, g1, _, g3 = fit.ground
+    along, inward = (g1 - g0) / total, (g3 - g0) / depth
+
+    def stall(position: float, size: float) -> np.ndarray:
+        points = [(position, 0.0), (position + size, 0.0), (position + size + shift, depth), (position + shift, depth)]
+        return np.array([g0 + u * along + v * inward for u, v in points])
+
+    moto = extras["moto_width"] / sin
+    end = start + extras["count"] * pitch
+    return (
+        [stall(start - (extras["motos_start"] - i) * moto, moto) for i in range(extras["motos_start"])]
+        + [stall(start + i * pitch, pitch) for i in range(extras["count"])]
+        + [stall(end + i * moto, moto) for i in range(extras["motos_end"])]
     )
-    return image, meters_to_pixels
+
+
+def _alignment(fits: tuple[RowFit, ...]) -> np.ndarray:
+    """Giro que deja las filas paralelas a los ejes del plano.
+
+    El mapa 3D dibuja cada puesto como un rectángulo alineado con los ejes, así que las
+    filas se enderezan: se gira lo mínimo (menos de 45 grados) para que el frente de las
+    filas quede horizontal o vertical. Lo cercano a la cámara sigue quedando abajo.
+    """
+    angles = np.array([np.arctan2(*(fit.ground[1] - fit.ground[0])[::-1]) for fit in fits])
+    # Promedio de direcciones módulo 90 grados: se multiplican por 4 para que 0, 90, 180 y 270 coincidan.
+    mean = np.arctan2(np.sin(4 * angles).mean(), np.cos(4 * angles).mean()) / 4
+    return _rotation(-mean)
+
+
+def layout_from_rows(
+    cells: dict[str, dict[str, Any]],
+    rows: list[Any],
+) -> list[dict[str, Any]] | None:
+    """Plano de planta de las celdas usando las filas calibradas del editor.
+
+    cells: nombre -> {"points": 4 esquinas relativas, "puesto_id": int | None, "fila": int | None}.
+    rows: las filas tal como las guardó el editor. Las celdas de una fila toman la medida
+    exacta de su puesto; las sueltas se llevan al plano con la misma calibración.
+    Devuelve None si no hay filas utilizables, para seguir con el cálculo anterior.
+    """
+    parsed = {index: entry for index, raw in enumerate(rows or []) if (entry := _editor_row(index, raw))}
+    if not parsed:
+        return None
+    calibration = calibrate([row for row, _ in parsed.values()])
+    turn = _alignment(calibration.rows)
+
+    stalls_by_row = {
+        index: [polygon @ turn.T for polygon in _row_stalls_ground(fit, row, extras)]
+        for (index, (row, extras)), fit in zip(parsed.items(), calibration.rows)
+    }
+    taken: dict[int, set[int]] = {index: set() for index in stalls_by_row}
+
+    layout = []
+    for label, cell in cells.items():
+        if cell.get("puesto_id") is None:
+            continue
+        ground = apply(calibration.homography, np.asarray(cell["points"], dtype=float)) @ turn.T
+        stalls = stalls_by_row.get(cell.get("fila"))
+        if stalls:
+            # La celda es uno de los puestos de su fila: el más cercano que no se haya usado.
+            center = ground.mean(axis=0)
+            order = sorted(range(len(stalls)), key=lambda i: np.linalg.norm(stalls[i].mean(axis=0) - center))
+            chosen = next((i for i in order if i not in taken[cell["fila"]]), order[0])
+            taken[cell["fila"]].add(chosen)
+            ground = stalls[chosen]
+        low, high = ground.min(axis=0), ground.max(axis=0)
+        layout.append({
+            "label": label,
+            "parkingSpaceId": cell["puesto_id"],
+            "x0": round(float(low[0]), 2), "x1": round(float(high[0]), 2),
+            "y0": round(float(low[1]), 2), "y1": round(float(high[1]), 2),
+        })
+    return layout

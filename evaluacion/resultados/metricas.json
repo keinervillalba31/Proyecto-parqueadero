@@ -1,0 +1,291 @@
+{
+ "configuracion": {
+  "modelo": "yolo11n.pt",
+  "confianza": 0.15,
+  "imgsz": 960,
+  "tiles": 2,
+  "iou_minimo": 0.5
+ },
+ "condiciones": {
+  "original": {
+   "tp": 45,
+   "fp_en_etiquetadas": 6,
+   "fp_en_vacios": 4,
+   "fn": 0,
+   "ignoradas": 40,
+   "precision": 0.818,
+   "recall": 1.0,
+   "f1": 0.9,
+   "por_imagen": {
+    "sim_00000.jpg": {
+     "tp": 14,
+     "fp": 0,
+     "fn": 0
+    },
+    "largo_00900.jpg": {
+     "tp": 11,
+     "fp": 2,
+     "fn": 0
+    },
+    "img_imagen2.jpg": {
+     "tp": 10,
+     "fp": 0,
+     "fn": 0
+    },
+    "img_imagen3.jpg": {
+     "tp": 10,
+     "fp": 4,
+     "fn": 0
+    }
+   },
+   "vacios": {
+    "img_imagen5.jpg": 2,
+    "img_imagen6.jpg": 1,
+    "img_imagen7.jpg": 1,
+    "img_imagen8.jpg": 0,
+    "img_imagen9.jpg": 0,
+    "img_imagen10.jpg": 0
+   }
+  },
+  "sobreexpuesto (sol fuerte)": {
+   "tp": 43,
+   "fp_en_etiquetadas": 12,
+   "fp_en_vacios": 0,
+   "fn": 2,
+   "ignoradas": 38,
+   "precision": 0.782,
+   "recall": 0.956,
+   "f1": 0.86,
+   "por_imagen": {
+    "sim_00000.jpg": {
+     "tp": 13,
+     "fp": 1,
+     "fn": 1
+    },
+    "largo_00900.jpg": {
+     "tp": 10,
+     "fp": 5,
+     "fn": 1
+    },
+    "img_imagen2.jpg": {
+     "tp": 10,
+     "fp": 1,
+     "fn": 0
+    },
+    "img_imagen3.jpg": {
+     "tp": 10,
+     "fp": 5,
+     "fn": 0
+    }
+   },
+   "vacios": {
+    "img_imagen5.jpg": 0,
+    "img_imagen6.jpg": 0,
+    "img_imagen7.jpg": 0,
+    "img_imagen8.jpg": 0,
+    "img_imagen9.jpg": 0,
+    "img_imagen10.jpg": 0
+   }
+  },
+  "atardecer (-50% brillo)": {
+   "tp": 44,
+   "fp_en_etiquetadas": 10,
+   "fp_en_vacios": 3,
+   "fn": 1,
+   "ignoradas": 38,
+   "precision": 0.772,
+   "recall": 0.978,
+   "f1": 0.863,
+   "por_imagen": {
+    "sim_00000.jpg": {
+     "tp": 14,
+     "fp": 0,
+     "fn": 0
+    },
+    "largo_00900.jpg": {
+     "tp": 11,
+     "fp": 3,
+     "fn": 0
+    },
+    "img_imagen2.jpg": {
+     "tp": 9,
+     "fp": 3,
+     "fn": 1
+    },
+    "img_imagen3.jpg": {
+     "tp": 10,
+     "fp": 4,
+     "fn": 0
+    }
+   },
+   "vacios": {
+    "img_imagen5.jpg": 2,
+    "img_imagen6.jpg": 0,
+    "img_imagen7.jpg": 1,
+    "img_imagen8.jpg": 0,
+    "img_imagen9.jpg": 0,
+    "img_imagen10.jpg": 0
+   }
+  },
+  "poca luz (-75% + ruido)": {
+   "tp": 40,
+   "fp_en_etiquetadas": 5,
+   "fp_en_vacios": 2,
+   "fn": 5,
+   "ignoradas": 33,
+   "precision": 0.851,
+   "recall": 0.889,
+   "f1": 0.87,
+   "por_imagen": {
+    "sim_00000.jpg": {
+     "tp": 14,
+     "fp": 1,
+     "fn": 0
+    },
+    "largo_00900.jpg": {
+     "tp": 8,
+     "fp": 2,
+     "fn": 3
+    },
+    "img_imagen2.jpg": {
+     "tp": 8,
+     "fp": 0,
+     "fn": 2
+    },
+    "img_imagen3.jpg": {
+     "tp": 10,
+     "fp": 2,
+     "fn": 0
+    }
+   },
+   "vacios": {
+    "img_imagen5.jpg": 0,
+    "img_imagen6.jpg": 1,
+    "img_imagen7.jpg": 1,
+    "img_imagen8.jpg": 0,
+    "img_imagen9.jpg": 0,
+    "img_imagen10.jpg": 0
+   }
+  },
+  "noche (-88% + ruido)": {
+   "tp": 36,
+   "fp_en_etiquetadas": 3,
+   "fp_en_vacios": 0,
+   "fn": 9,
+   "ignoradas": 18,
+   "precision": 0.923,
+   "recall": 0.8,
+   "f1": 0.857,
+   "por_imagen": {
+    "sim_00000.jpg": {
+     "tp": 13,
+     "fp": 0,
+     "fn": 1
+    },
+    "largo_00900.jpg": {
+     "tp": 8,
+     "fp": 0,
+     "fn": 3
+    },
+    "img_imagen2.jpg": {
+     "tp": 5,
+     "fp": 0,
+     "fn": 5
+    },
+    "img_imagen3.jpg": {
+     "tp": 10,
+     "fp": 3,
+     "fn": 0
+    }
+   },
+   "vacios": {
+    "img_imagen5.jpg": 0,
+    "img_imagen6.jpg": 0,
+    "img_imagen7.jpg": 0,
+    "img_imagen8.jpg": 0,
+    "img_imagen9.jpg": 0,
+    "img_imagen10.jpg": 0
+   }
+  },
+  "niebla (bajo contraste)": {
+   "tp": 42,
+   "fp_en_etiquetadas": 9,
+   "fp_en_vacios": 1,
+   "fn": 3,
+   "ignoradas": 39,
+   "precision": 0.808,
+   "recall": 0.933,
+   "f1": 0.866,
+   "por_imagen": {
+    "sim_00000.jpg": {
+     "tp": 14,
+     "fp": 0,
+     "fn": 0
+    },
+    "largo_00900.jpg": {
+     "tp": 10,
+     "fp": 2,
+     "fn": 1
+    },
+    "img_imagen2.jpg": {
+     "tp": 8,
+     "fp": 3,
+     "fn": 2
+    },
+    "img_imagen3.jpg": {
+     "tp": 10,
+     "fp": 4,
+     "fn": 0
+    }
+   },
+   "vacios": {
+    "img_imagen5.jpg": 0,
+    "img_imagen6.jpg": 0,
+    "img_imagen7.jpg": 0,
+    "img_imagen8.jpg": 0,
+    "img_imagen9.jpg": 0,
+    "img_imagen10.jpg": 1
+   }
+  },
+  "compresión/ruido": {
+   "tp": 42,
+   "fp_en_etiquetadas": 15,
+   "fp_en_vacios": 0,
+   "fn": 3,
+   "ignoradas": 42,
+   "precision": 0.737,
+   "recall": 0.933,
+   "f1": 0.824,
+   "por_imagen": {
+    "sim_00000.jpg": {
+     "tp": 14,
+     "fp": 0,
+     "fn": 0
+    },
+    "largo_00900.jpg": {
+     "tp": 10,
+     "fp": 3,
+     "fn": 1
+    },
+    "img_imagen2.jpg": {
+     "tp": 8,
+     "fp": 6,
+     "fn": 2
+    },
+    "img_imagen3.jpg": {
+     "tp": 10,
+     "fp": 6,
+     "fn": 0
+    }
+   },
+   "vacios": {
+    "img_imagen5.jpg": 0,
+    "img_imagen6.jpg": 0,
+    "img_imagen7.jpg": 0,
+    "img_imagen8.jpg": 0,
+    "img_imagen9.jpg": 0,
+    "img_imagen10.jpg": 0
+   }
+  }
+ }
+}

@@ -4,7 +4,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from .plate_reader import DEFAULT_PLATE_PATTERN
+from .plate_reader import DEFAULT_LOCAL_DETECTOR, DEFAULT_LOCAL_OCR, DEFAULT_PLATE_PATTERN
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
@@ -45,6 +45,8 @@ def video_fallback_from_env() -> str:
 class Settings:
     model_path: Path = project_path("YOLO_MODEL", SCRIPT_DIR / "yolo11n.pt")
     cells_path: Path = project_path("PARKING_CELLS", SCRIPT_DIR / "estacionamientos.json")
+    # Cuadro sobre el que se trazaron las celdas: con él se compensa si la cámara se corre.
+    cells_reference_path: Path = project_path("CELLS_REFERENCE", PROJECT_DIR / "referencia_celdas.jpg")
     registered_vehicles_path: Path = project_path(
         "REGISTERED_VEHICLES", SCRIPT_DIR / "vehiculos_registrados.json"
     )
@@ -53,12 +55,26 @@ class Settings:
     yolo_confidence: float = float(os.getenv("YOLO_CONFIDENCE", "0.15"))
     yolo_image_size: int = int(os.getenv("YOLO_IMAGE_SIZE", "960"))
     yolo_tile_grid: int = int(os.getenv("YOLO_TILE_GRID", "2"))
-    occupancy_frames: int = int(os.getenv("OCCUPANCY_FRAMES", "3"))
+    # Detección automática de puestos (el editor la inicia): modelo de segmentación, tamaño de
+    # imagen (más grande ve los carros lejanos) y minutos quieto para que un vehículo marque un puesto.
+    cell_detection_model_path: Path = project_path("CELL_DETECTION_MODEL", SCRIPT_DIR / "yolo11n-seg.pt")
+    cell_detection_image_size: int = int(os.getenv("CELL_DETECTION_IMAGE_SIZE", "1600"))
+    cell_detection_dwell_minutes: float = float(os.getenv("CELL_DETECTION_DWELL_MINUTES", "3"))
+    # Segundos seguidos viendo un vehículo para dar un puesto por ocupado, y sin verlo para darlo por libre.
+    occupancy_occupy_seconds: float = float(os.getenv("OCCUPANCY_OCCUPY_SECONDS", "2"))
+    occupancy_free_seconds: float = float(os.getenv("OCCUPANCY_FREE_SECONDS", "8"))
     reservation_timeout_seconds: float = float(
         os.getenv("RESERVATION_TIMEOUT_SECONDS", "600")
     )
     minimum_box_area: int = int(os.getenv("MIN_BOX_AREA", "500"))
     minimum_motorcycle_area: int = int(os.getenv("MIN_MOTORCYCLE_AREA", "100"))
+    # Motor de lectura de placas: "local" (modelos abiertos, sin créditos), "roboflow" (API)
+    # o "hibrido" (local y Roboflow solo cuando el local ve una placa y no la logra leer).
+    plate_engine: str = os.getenv("PLATE_ENGINE", "local").strip().lower()
+    plate_local_detector: str = os.getenv("PLATE_LOCAL_DETECTOR", DEFAULT_LOCAL_DETECTOR)
+    plate_local_ocr: str = os.getenv("PLATE_LOCAL_OCR", DEFAULT_LOCAL_OCR)
+    # Usar el tipo de vehículo de YOLO (carro o moto) para saber qué formato de placa esperar.
+    plate_use_vehicle_kind: bool = os.getenv("PLATE_USE_VEHICLE_KIND", "true").lower() == "true"
     plate_interval_frames: int = int(os.getenv("PLATE_INTERVAL_FRAMES", "15"))
     plate_confirmation_reads: int = int(os.getenv("PLATE_CONFIRMATION_READS", "2"))
     plate_cooldown_seconds: float = float(os.getenv("PLATE_COOLDOWN_SECONDS", "30"))
@@ -84,6 +100,10 @@ class Settings:
     camera_discovery_id: str = os.getenv("CAMERA_DISCOVERY_ID", "")
     service_host: str = os.getenv("SERVICE_HOST", "0.0.0.0")
     service_port: int = int(os.getenv("SERVICE_PORT", "8000"))
+    # Orígenes web que pueden llamar al servicio desde el navegador (el editor de celdas de la plataforma).
+    cors_origins: tuple[str, ...] = tuple(
+        origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://localhost:4200").split(",") if origin.strip()
+    )
     # Dirección con la que los navegadores llegan a este servicio (se envía a Monitoreo).
     # Vacío = la IP que tenga este equipo en la red en ese momento.
     service_public_url: str = os.getenv("SERVICE_PUBLIC_URL", "").rstrip("/")
@@ -121,6 +141,25 @@ class Settings:
     backend_occupancy_resend_seconds: float = float(os.getenv("BACKEND_OCCUPANCY_RESEND_SECONDS", "60"))
     backend_request_timeout_seconds: float = float(os.getenv("BACKEND_REQUEST_TIMEOUT_SECONDS", "5"))
     backend_students_cache_seconds: float = float(os.getenv("BACKEND_STUDENTS_CACHE_SECONDS", "300"))
+
+    # --- Nodo de visión: un solo proceso atiende varias cámaras ---
+    # Con NODE_CODE el servicio trabaja como nodo: le pregunta a la plataforma qué cámaras le tocan
+    # (Monitoreo > Nodos) y las atiende todas con un solo modelo. Sin él, es una sola cámara con lo
+    # que diga este archivo (VIDEO_SOURCE, BACKEND_CAMERA_ID...), como siempre.
+    node_code: str = os.getenv("NODE_CODE", "").strip()
+    # URL con la que la plataforma llega a este nodo (para ver el video y abrir el editor de celdas).
+    node_public_url: str = os.getenv("NODE_PUBLIC_URL", "").strip().rstrip("/")
+    # Para simular varias cámaras sin plataforma: un JSON con la lista de cámaras (ver README).
+    node_cameras_file: Path | None = project_path("NODE_CAMERAS_FILE", Path("")) if os.getenv("NODE_CAMERAS_FILE") else None
+    # Carpeta con lo que guarda cada cámara (celdas, referencia, interruptores): camaras/<id>/.
+    node_data_dir: Path = project_path("NODE_DATA_DIR", PROJECT_DIR / "camaras")
+    node_config_poll_seconds: float = float(os.getenv("NODE_CONFIG_POLL_SECONDS", "10"))
+    node_heartbeat_seconds: float = float(os.getenv("NODE_HEARTBEAT_SECONDS", "10"))
+    # Cada cuántos segundos se analiza un cuadro de cada cámara (0 = tan seguido como se pueda).
+    # La ocupación no necesita más de uno cada pocos segundos: la histéresis ya pide varios.
+    analysis_interval_seconds: float = float(os.getenv("ANALYSIS_INTERVAL_SECONDS", "0"))
+    # Cuadros por segundo máximos del video en vivo que se publica (0 = todos los de la fuente).
+    stream_max_fps: float = float(os.getenv("STREAM_MAX_FPS", "0"))
 
 
 settings = Settings()

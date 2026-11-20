@@ -96,10 +96,11 @@
       <p class="dato" id="estado-placa" style="margin-top:10px"></p>
       <p class="dato" id="celda-placa" hidden></p>
       <p class="dato" id="plataforma-placa" hidden></p>
+      <p class="dato" id="motor-placa" hidden></p>
     </div>
     <details>
       <summary>Probar con una foto</summary>
-      <p>Sube la foto de un vehículo para ver qué placa se lee. Funciona aunque la lectura esté apagada; cada foto es una consulta a Roboflow.</p>
+      <p>Sube la foto de un vehículo para ver qué placa se lee. Funciona aunque la lectura esté apagada; usa el mismo motor que la lectura (con Roboflow, cada foto es una consulta).</p>
       <input type="file" id="foto" accept="image/*">
       <p id="resultado-foto" aria-live="polite"></p>
     </details>
@@ -185,6 +186,14 @@ function pintarPlaca(placa) {
   if (placa.estado === "confirmando" && placa.ultimo_resultado) texto += " (" + placa.ultimo_resultado + ")";
   if (placa.estado === "error_lectura" && placa.error) texto += ": " + placa.error;
   $("estado-placa").textContent = texto;
+
+  // Qué motor lee y cuántas consultas a Roboflow se hicieron (en modo híbrido, las que no se ahorraron).
+  const motores = { local: "Lector local", hibrido: "Lector híbrido", roboflow: "Roboflow" };
+  $("motor-placa").hidden = !placa.motor;
+  if (placa.motor) {
+    $("motor-placa").textContent = (motores[placa.motor] || placa.motor) + " · " + (placa.lecturas_locales || 0)
+      + " lecturas locales · " + (placa.consultas_roboflow || 0) + " consultas a Roboflow";
+  }
 
   $("celda-placa").hidden = !placa.celda_asignada;
   $("celda-placa").textContent = placa.celda_asignada ? "Celda asignada: " + placa.celda_asignada : "";

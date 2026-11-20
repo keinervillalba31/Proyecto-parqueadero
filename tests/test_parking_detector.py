@@ -31,19 +31,60 @@ def test_small_boxes_are_ignored_except_motorcycles(make_detector):
     assert state["celdas"]["Celda_2"]["ocupado"] is True
 
 
-def test_smoothing_ignores_a_single_missed_frame(make_detector):
-    detector = make_detector(occupancy_frames=3)
-    for _ in range(3):
-        state = run(detector, [CAR_IN_CELL_1])
-    assert state["celdas"]["Celda_1"]["ocupado"] is True
+class Clock:
+    def __init__(self) -> None:
+        self.now = 0.0
 
-    # Un cuadro sin detección no libera la celda...
-    assert run(detector, [])["celdas"]["Celda_1"]["ocupado"] is True
-    assert run(detector, [CAR_IN_CELL_1])["celdas"]["Celda_1"]["ocupado"] is True
-    # ...pero tres seguidos sí.
-    for _ in range(3):
-        state = run(detector, [])
-    assert state["celdas"]["Celda_1"]["ocupado"] is False
+    def __call__(self) -> float:
+        return self.now
+
+
+def occupied_over(detector, clock, frames, seconds_per_frame=1.0):
+    """Analiza un cuadro por segundo con las detecciones dadas y devuelve si Celda_1 quedó ocupada en cada uno."""
+    result = []
+    for detections in frames:
+        result.append(run(detector, detections)["celdas"]["Celda_1"]["ocupado"])
+        clock.now += seconds_per_frame
+    return result
+
+
+def test_a_car_counts_as_parked_only_after_being_seen_for_a_while(make_detector):
+    clock = Clock()
+    detector = make_detector(occupy_seconds=2, free_seconds=8, clock=clock)
+    assert occupied_over(detector, clock, [[CAR_IN_CELL_1]] * 4) == [False, False, True, True]
+
+
+def test_a_car_detected_only_now_and_then_keeps_its_space(make_detector):
+    # Como un carro del fondo que YOLO pierde y recupera: el puesto no parpadea.
+    clock = Clock()
+    detector = make_detector(occupy_seconds=2, free_seconds=8, clock=clock)
+    occupied_over(detector, clock, [[CAR_IN_CELL_1]] * 3)
+    flickering = [[], [], [CAR_IN_CELL_1], [], [], [], [CAR_IN_CELL_1], []] * 3
+    assert all(occupied_over(detector, clock, flickering))
+
+
+def test_a_space_is_freed_after_the_car_is_gone_for_long_enough(make_detector):
+    clock = Clock()
+    detector = make_detector(occupy_seconds=2, free_seconds=8, clock=clock)
+    occupied_over(detector, clock, [[CAR_IN_CELL_1]] * 3)
+    states = occupied_over(detector, clock, [[]] * 10)
+    assert states[:8] == [True] * 8
+    assert states[8:] == [False, False]
+
+
+def test_a_passing_car_does_not_take_the_space(make_detector):
+    clock = Clock()
+    detector = make_detector(occupy_seconds=2, free_seconds=8, clock=clock)
+    passing = [[], [CAR_IN_CELL_1], [], [CAR_IN_CELL_1], []]
+    assert not any(occupied_over(detector, clock, passing))
+
+
+def test_the_timing_does_not_depend_on_how_fast_frames_are_analyzed(make_detector):
+    clock = Clock()
+    detector = make_detector(occupy_seconds=2, free_seconds=8, clock=clock)
+    # A 10 cuadros por segundo hacen falta los mismos 2 segundos, no 3 cuadros.
+    states = occupied_over(detector, clock, [[CAR_IN_CELL_1]] * 25, seconds_per_frame=0.1)
+    assert states.index(True) == 20
 
 
 def test_reserved_free_cell_is_reported(make_detector):
@@ -56,3 +97,41 @@ def test_reserved_free_cell_is_reported(make_detector):
 def test_tile_starts_cover_the_whole_axis(make_detector):
     assert make_detector(tile_grid=2).vehicles._tile_starts(1000, 675) == [0, 325]
     assert make_detector(tile_grid=3).vehicles._tile_starts(900, 405) == [0, 248, 495]
+
+
+def test_cells_follow_the_image_when_the_camera_moves(make_detector):
+    class FixedMove:
+        source = "guardada"
+        # La cámara se corrió 100 px a la derecha: lo que ahora está en x vuelve a x - 100.
+        last_transform = np.array([[1.0, 0.0, -100.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+        last_shift = (100.0, 0.0)
+
+        def transform(self, frame):
+            return self.last_transform
+
+        def consider(self, frame, fit):
+            pass
+
+        def cells_changed(self):
+            pass
+
+    detector = make_detector()
+    detector.aligner = FixedMove()
+    # El carro de Celda_1 aparece donde estaba Celda_2.
+    shifted_car = (CAR, 0.9, (130, 50, 170, 90))
+    state = run(detector, [shifted_car])
+    assert state["celdas"]["Celda_1"]["ocupado"] is True
+    assert state["celdas"]["Celda_2"]["ocupado"] is False
+    assert state["alineacion"] == {"referencia": "guardada", "compensando": True, "dx": 100.0, "dy": 0.0}
+
+
+def test_a_partial_box_of_a_car_cut_by_a_tile_is_not_a_second_car(make_detector):
+    # Caja completa en Celda_1 y la parte que vio un recorte, con su punto de apoyo en Celda_2.
+    full = (CAR, 0.9, (40, 20, 150, 90))
+    partial = (CAR, 0.6, (105, 25, 150, 88))
+    # Dos carros vecinos de verdad se superponen poco y se mantienen.
+    neighbour = (CAR, 0.8, (150, 30, 200, 95))
+    from app.parking_detector import _drop_partial_boxes
+
+    assert _drop_partial_boxes([partial, full]) == [full]
+    assert sorted(_drop_partial_boxes([full, neighbour])) == sorted([full, neighbour])

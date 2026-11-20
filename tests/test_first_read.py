@@ -35,12 +35,12 @@ def make_plate_service(make_detector, outcomes: dict[str, str]):
         return entry_result(outcomes.get(plate, "NOT_REGISTERED"), plate)
 
     service.backend = SimpleNamespace(sync_plate_detection=sync_plate_detection)
-    service.plates.read_all = lambda image: list(image)  # la "imagen" ya trae sus placas
+    service.plates.read_all = lambda image, kind=None: list(image)  # la "imagen" ya trae sus placas
     return service, sent
 
 
 def read(service, *plates: str) -> None:
-    service._read_plate([list(plates)])
+    service._read_plate([(list(plates), None)])
     for worker in list(service_threads(service)):
         worker.join(timeout=2)
 

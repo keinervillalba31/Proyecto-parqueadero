@@ -1,14 +1,14 @@
 # Sistema de parqueadero
 
 Detecta la ocupación de las celdas de un parqueadero con YOLO a partir de un video,
-lee las placas con Roboflow y asigna una celda libre a los vehículos registrados.
+lee las placas (con un lector local abierto o con Roboflow) y asigna una celda libre a los vehículos registrados.
 
 ## Responsabilidades
 
 - `scripts/admin/configure_spaces.py`: el administrador marca las cuatro esquinas de cada celda y se guarda `estacionamientos.json`.
 - `scripts/admin/probar_placas.py`: prueba solo el lector de placas con un video o una imagen.
 - `scripts/app/parking_detector.py`: usa YOLO para detectar vehículos y marcar las celdas ocupadas o libres, con suavizado entre cuadros.
-- `scripts/app/plate_reader.py`: envía capturas a Roboflow y confirma la placa con varias lecturas.
+- `scripts/app/plate_reader.py`: lee las placas con el motor elegido (`PLATE_ENGINE`: local, Roboflow o híbrido) y confirma la placa con varias lecturas.
 - `scripts/app/video_service.py`: coordina el video, el detector, el lector de placas y las reservas de celdas.
 - `scripts/app/backend_client.py`: cuando una placa registrada se confirma, le pide a `educore-backend` que asigne y guarde el puesto (ver "Sincronización con el backend").
 - `scripts/app/main.py`: expone la API con FastAPI.
@@ -22,7 +22,32 @@ Requiere **Python 3.12** (`inference-sdk` todavía no es compatible con versione
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-copy .env.example .env   # y completar ROBOFLOW_API_KEY, ROBOFLOW_WORKSPACE, ROBOFLOW_WORKFLOW
+pip install --no-deps -r requirements-placas.txt   # lector de placas local (ver abajo)
+copy .env.example .env   # Roboflow es opcional: solo para PLATE_ENGINE=roboflow o hibrido
+```
+
+### Lector de placas local (sin API)
+
+Por defecto (`PLATE_ENGINE=local`) las placas se leen **solo en este equipo** con FastALPR
+(licencia MIT): un YOLOv9 que encuentra la placa y un OCR entrenado solo con placas, ambos en
+ONNX para CPU (~90 ms por recorte). Los modelos (~28 MB) se descargan la primera vez y luego
+no hace falta internet ni créditos.
+
+Con `PLATE_ENGINE=hibrido`, Roboflow se consulta solo si el detector local ve una placa y no
+logra leerla, y solo si hay credenciales; si falla o se acaban los créditos, sigue en local.
+`PLATE_ENGINE=roboflow` usa solo la API, como antes. El panel muestra cuántas lecturas fueron
+locales y cuántas consultas se hicieron a Roboflow.
+
+`requirements-placas.txt` se instala con `--no-deps` porque FastALPR pide
+`opencv-python-headless`, que choca con el `opencv-python` del servicio (traen el mismo `cv2`).
+
+Además, con el tipo de vehículo de YOLO se sabe qué formato esperar (carro `ABC123`, moto
+`ABC12D`): así `YZA916` leída en una moto se corrige a `YZA91G`.
+
+Para medir la exactitud con una grabación propia:
+
+```powershell
+python scripts/admin/probar_placas.py videos/video-placa.mp4 --placa-real YZA91G
 ```
 
 Todas las rutas relativas del `.env` se toman desde la raíz del proyecto.
@@ -89,7 +114,7 @@ celdas y la última placa, y tiene un interruptor para cada cosa:
 
 - **Espacios**: detección de celdas libres y ocupadas. Apagado, se conservan los últimos
   datos y deja de enviarse la ocupación al backend.
-- **Placas**: lectura de placas. Apagado, no se hacen consultas a Roboflow.
+- **Placas**: lectura de placas. Apagado, no se lee ninguna placa (ni local ni en Roboflow).
 
 **Desde la plataforma.** Con `BACKEND_SYNC_ENABLED=true`, los mismos dos interruptores están
 en la página **Monitoreo** (los puede mover quien tenga el permiso `MONITORING_MANAGE`). El
@@ -187,15 +212,71 @@ Las pruebas simulan YOLO, así que no necesitan GPU ni video.
 - `GET /estado`: estado combinado. También se publica cada 0.5 s por WebSocket en `/ws/estado`.
 - `GET /health`: indica si el hilo de video funciona.
 - `POST /vision/license-plates`: prueba puntual con una imagen (máximo 10 MB).
+- `GET /nodo`: cámaras que atiende el proceso, dispositivo (CPU o GPU) y estado de cada una.
+- Todas las rutas de una cámara existen también como `/camaras/{id}/...` (por ejemplo
+  `/camaras/4/video`, `/camaras/4/snapshot`, `/camaras/4/celdas/referencia`). Sin número usan
+  la cámara única o, en un nodo, la primera de ocupación.
+
+## Nodo de visión (varias cámaras)
+
+Un solo proceso puede atender todas las cámaras de un parqueadero (o del campus) con **un solo
+modelo YOLO** en memoria. Las cámaras se turnan el modelo, y cada una se analiza cada pocos
+segundos: la ocupación no necesita más, porque la histéresis ya pide varios segundos para
+cambiar un puesto.
+
+Con la plataforma:
+
+```
+BACKEND_SYNC_ENABLED=true
+NODE_CODE=nodo-norte              # el código del nodo en Monitoreo > Nodos
+NODE_PUBLIC_URL=http://10.0.0.5:8000   # cómo llega la plataforma a este equipo
+```
+
+El nodo le pregunta a la plataforma cada `NODE_CONFIG_POLL_SECONDS` qué cámaras le tocan
+(fuente, tipo, parqueadero, si está encendida) y las arranca, las para o las rearma solas; y
+cada `NODE_HEARTBEAT_SECONDS` le reporta su URL, si usa GPU y cómo va cada cámara. Si el nodo
+no existe en la plataforma, se registra solo en su primer reporte.
+
+Tipos de cámara: `OCCUPANCY` (ve los puestos), `ENTRY` (lee placas en una entrada) y `MIXED`
+(las dos cosas, como la instalación de una sola cámara). Lo de cada cámara (celdas locales,
+referencia del trazado, interruptores) se guarda en `camaras/<id>/` (`NODE_DATA_DIR`).
+
+Sin plataforma, para simular varias cámaras con videos:
+
+```json
+{
+  "services": {"spacesEnabled": true, "platesEnabled": false},
+  "cameras": [
+    {"id": 101, "name": "Simulada 1", "type": "OCCUPANCY", "sourceUrl": "videos/parking_simulacion.mp4"},
+    {"id": 102, "name": "Entrada", "type": "ENTRY", "sourceUrl": "videos/placas.mp4", "parkingId": 4}
+  ]
+}
+```
+
+```
+NODE_CAMERAS_FILE=camaras.json
+```
+
+Ajustes por cámara (desde la plataforma o el archivo): `analysisSeconds` (por defecto 3 s en
+ocupación y 0,5 s en entradas) y `tileGrid` (recortes por lado al analizar). Sin GPU no se
+recorta por defecto: medido con 6 cámaras en un PC sin GPU, con recortes 2×2 el modelo no
+alcanzaba (un análisis cada 6,4 s y la cuenta oscilaba entre 23 y 30), y sin recortes cada
+cámara se analizaba cada 3 s con el modelo al 45 % y la ocupación estable en 28-29 (hay unos 28 carros). Con GPU
+(`cuda`), se usa `YOLO_TILE_GRID`. El video en vivo de cada cámara se publica a lo sumo a
+`STREAM_MAX_FPS` (10 en un nodo) y los cuadros de en medio no se convierten a imagen.
+
+Sin `NODE_CODE` ni `NODE_CAMERAS_FILE` el servicio es una sola cámara con lo que diga el `.env`,
+como siempre.
 
 ## Flujo
 
 1. El administrador configura las coordenadas de las celdas.
 2. YOLO analiza cada cuadro. Una celda está ocupada si el punto inferior central de la
-   caja de un vehículo cae dentro de ella. El cambio de estado solo se acepta después de
-   `OCCUPANCY_FRAMES` cuadros seguidos, para que no parpadee.
+   caja de un vehículo cae dentro de ella. Para que no parpadee, un puesto pasa a ocupado tras
+   `OCCUPANCY_OCCUPY_SECONDS` segundos seguidos viendo el vehículo, y a libre tras
+   `OCCUPANCY_FREE_SECONDS` sin verlo (más tiempo, porque YOLO pierde a ratos los carros lejanos).
 3. Cuando hay un vehículo, cada `PLATE_INTERVAL_FRAMES` cuadros se recortan los vehículos
-   más cercanos que no estén estacionados y se envían a Roboflow.
+   más cercanos que no estén estacionados y se leen con el motor de `PLATE_ENGINE`.
    - Se descarta el texto que no tenga formato de placa (`PLATE_PATTERN`) y se corrigen
      confusiones típicas del OCR (O/0, I/1, B/8, S/5...).
    - La placa se confirma con `PLATE_CONFIRMATION_READS` lecturas parecidas: las que
@@ -239,6 +320,51 @@ polígono en la `planta` (metros), y por cada fila su `error_cm`. Una sola fila 
 cámara; con dos o más (`verificada: true`) una fila con error alto indica esquinas mal puestas
 o una cantidad de puestos equivocada. El plano queda como se vería la cámara desde arriba: lo
 cercano a la cámara abajo.
+
+## Detección automática de puestos (prototipo)
+
+En vez de trazar las celdas, el sistema las propone observando **dónde se estacionan los
+vehículos**; no depende de que las líneas pintadas se vean bien. Cada celda sale marcada como
+*observada* (hubo un vehículo quieto en ella) o *deducida* (hueco entre carros de una fila, o la
+fila de enfrente de una fila doble), para revisar primero las deducidas.
+
+```powershell
+python scripts/admin/detectar_puestos.py grabacion.mp4 --cada-segundos 5
+# medir contra celdas trazadas a mano sobre el mismo cuadro:
+python scripts/admin/detectar_puestos.py videos/parking_simulacion.mp4 --imagen-referencia referencia_celdas.jpg --referencia celdas.json
+# parqueaderos simulados desde varias cámaras:
+python scripts/admin/simular_puestos.py
+```
+
+Cómo funciona (`scripts/app/auto_cells.py`): siluetas de vehículos con `yolo11n-seg`, llevadas
+al cuadro de referencia; los vehículos quietos se agrupan en filas rectas; de las filas salen
+los dos puntos de fuga del suelo (filas y separadores, suponiendo la cámara sin ladear); a lo
+largo de cada fila los puestos se reparten con paso constante en escala proyectiva, así un
+hueco de dos pasos es un puesto vacío. Una fila que da celdas imposibles se descarta y sus
+carros reciben una celda cada uno.
+
+Para que encuentre los puestos vacíos conviene observar **horas con movimiento** (sirve un
+timelapse de una foto cada 5-10 s): un puesto que nadie usa durante la observación solo se
+deduce si queda entre carros o frente a una fila ocupada.
+
+**Desde la plataforma.** En el editor de celdas (Monitoreo → ▦ Celdas), el bloque *Detectar
+puestos automáticamente* elige cuánto observar (5 min de prueba a 4 h) y lo inicia en el
+servicio de la cámara; el editor se puede cerrar mientras tanto. Al terminar, *Cargar en el
+editor* reemplaza las celdas por las propuestas (las deducidas, punteadas en violeta), sobre la
+misma imagen en que se calcularon, y se vinculan solas a los puestos libres del parqueadero.
+Nada se guarda hasta pulsar *Guardar celdas*. El servicio analiza un cuadro cada 5 s; un puesto
+cuenta si un vehículo estuvo quieto en él `CELL_DETECTION_DWELL_MINUTES` (3 por defecto).
+
+| Ruta | Para qué |
+|---|---|
+| `GET /celdas/deteccion` | Estado (`inactiva`, `observando`, `calculando`, `lista`, `error`) y la propuesta |
+| `POST /celdas/deteccion` | Empieza: `{"minutos": 60, "cada_segundos": 5}` |
+| `POST /celdas/deteccion/terminar` | Deja de observar y calcula con lo visto |
+| `POST /celdas/deteccion/descartar` | Cancela o borra la propuesta |
+| `GET /celdas/deteccion/referencia` | Imagen a la que están referidas las celdas propuestas |
+
+Todas existen también como `/camaras/{id}/...`. La observación vive en memoria: si el
+servicio se reinicia, se pierde.
 
 ## Sincronización con el backend
 

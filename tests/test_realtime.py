@@ -28,6 +28,7 @@ def make_service(detector, detections=()) -> VideoService:
         plate_max_vehicles=3,
         plate_min_crop_width=1,
         plate_skip_parked=False,
+        plate_use_vehicle_kind=True,
     )
     service.parking = detector
     service.state = RuntimeState(total_spaces=2)
@@ -167,5 +168,6 @@ def test_plate_camera_sends_one_crop_per_vehicle(make_detector):
     service._read_plate_video_frame(blank_frame())
 
     assert len(sent) == 1
-    (crop,) = sent[0]
+    ((crop, kind),) = sent[0]
+    assert kind == "carro"
     assert crop.shape[:2] != blank_frame().shape[:2], "se envía el recorte, no el cuadro completo"

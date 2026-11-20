@@ -9,3 +9,8 @@ inference-sdk
 python-multipart
 python-dotenv
 requests
+# Lector de placas local: el resto va en requirements-placas.txt (se instala con --no-deps).
+onnxruntime>=1.20
+pyyaml
+rich
+tqdm

@@ -54,11 +54,13 @@ def test_cells_follow_a_change_of_video_resolution(make_detector):
 
 
 def test_reloading_cells_keeps_the_state_of_cells_that_remain(make_detector):
-    detector = make_detector(occupancy_frames=3)
+    now = [0.0]
+    detector = make_detector(occupy_seconds=2, free_seconds=8, clock=lambda: now[0])
     detector.set_relative_cells({"A-01": LEFT_HALF})
     detector.vehicles._detect_with_tiles = lambda f: [vehicle_at(30, 50, 70, 90)]
     for _ in range(3):
         detector.analyze(frame(200, 100))
+        now[0] += 1.0
 
     # El administrador agrega otra celda: A-01 no debe "parpadear" a libre.
     detector.set_relative_cells({
