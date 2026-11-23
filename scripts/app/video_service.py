@@ -835,14 +835,24 @@ class VideoService:
         return max_fps > 0 and time.monotonic() - self.last_published_at < 1.0 / max_fps
 
     def _publish_frame(self, frame: np.ndarray) -> None:
-        """Entrega el cuadro original al detector y al stream en vivo."""
+        """Entrega el cuadro original al detector y al stream en vivo.
+
+        Con STREAM_DRAW_CELLS=true el video en vivo lleva dibujado el último resultado del detector (celdas en
+        verde si están libres, rojo si están ocupadas, amarillo si están reservadas, y los recuadros de los
+        vehículos). El detector siempre recibe el cuadro original, sin dibujos.
+        """
         with self.frame_lock:
             self.latest_frame = frame
             self.latest_frame_id += 1
+            overlay = self.overlay if getattr(self.settings, "stream_draw_cells", False) else None
         # Con muchas cámaras, convertir y codificar cada cuadro cuesta más que analizarlos: el
         # video en vivo se publica a lo sumo a STREAM_MAX_FPS (ver _skip_frame).
         self.last_published_at = time.monotonic()
-        encoded_ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        display = frame
+        if overlay:
+            display = frame.copy()
+            self.parking.draw(display, *overlay)
+        encoded_ok, encoded = cv2.imencode(".jpg", display, [cv2.IMWRITE_JPEG_QUALITY, 80])
         if encoded_ok:
             self.state.set_frame(encoded.tobytes())
         self._count_video_frame()
