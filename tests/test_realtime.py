@@ -98,6 +98,24 @@ def test_publish_frame_streams_original_without_cell_overlay(make_detector):
     assert np.array_equal(published, frame)
 
 
+def test_publish_frame_draws_cells_when_enabled_and_keeps_detector_frame_clean(make_detector):
+    detector = make_detector()
+    detector.vehicles._detect_with_tiles = lambda frame: [CAR_IN_CELL_1]
+    service = make_service(detector, detections=[CAR_IN_CELL_1])
+    service.settings.stream_draw_cells = True
+    state, vehicles = detector.analyze(blank_frame())
+    service.overlay = (vehicles, state, {})
+    frame = blank_frame()
+    original = frame.copy()
+
+    service._publish_frame(frame)
+
+    _, encoded = service.state.get_frame()
+    published = cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_COLOR)
+    assert not np.array_equal(published, original)  # el video en vivo lleva las celdas dibujadas
+    assert np.array_equal(service.latest_frame, original)  # el detector recibe el cuadro sin dibujos
+
+
 def test_publish_plate_frame_is_independent_from_parking_stream(make_detector):
     service = make_service(make_detector())
     plate_frame = np.full((120, 220, 3), 255, dtype=np.uint8)

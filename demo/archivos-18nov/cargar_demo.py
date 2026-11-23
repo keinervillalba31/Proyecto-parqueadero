@@ -1,6 +1,6 @@
-"""Carga en el backend la cámara de la demo del parqueadero Archivos (video del 18-nov) con sus 46 celdas.
+"""Carga en el backend la cámara de la demo del parqueadero Archivos (video del 18-nov) con sus 42 celdas.
 
-Uso (con el backend encendido y el plano 3D de Archivos ya cargado, es decir, con los puestos AR-01…AR-45 y ARD-01):
+Uso (con el backend encendido y el plano 3D de Archivos ya cargado, es decir, con los puestos AR-01…AR-41 y ARD-01):
 
     python demo/archivos-18nov/cargar_demo.py
 

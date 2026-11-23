@@ -160,6 +160,9 @@ class Settings:
     analysis_interval_seconds: float = float(os.getenv("ANALYSIS_INTERVAL_SECONDS", "0"))
     # Cuadros por segundo máximos del video en vivo que se publica (0 = todos los de la fuente).
     stream_max_fps: float = float(os.getenv("STREAM_MAX_FPS", "0"))
+    # true: el video en vivo (/video/parqueadero) lleva dibujadas las celdas con su estado (verde libre, rojo
+    # ocupado) y los vehículos detectados. false (por defecto): se publica el cuadro limpio.
+    stream_draw_cells: bool = os.getenv("STREAM_DRAW_CELLS", "false").strip().lower() in ("1", "true", "si", "sí", "yes")
 
 
 settings = Settings()
