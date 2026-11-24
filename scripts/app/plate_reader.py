@@ -57,6 +57,28 @@ def edit_distance(first: str, second: str) -> int:
     return previous[-1]
 
 
+def vote_characters(reads: Iterable[str], fallback: str, strict: bool = False) -> str | None:
+    """Placa que sale de votar posición por posición entre lecturas del mismo vehículo.
+
+    Un error del OCR suele afectar un solo carácter y en lecturas distintas cae en posiciones
+    distintas (BRF509, BRF508, BRF589 -> BRF509). Solo cuentan las lecturas con el largo de
+    `fallback` y hacen falta al menos tres. Si en una posición hay empate se queda el carácter
+    de `fallback` (la lectura más repetida), o, con `strict`, no hay resultado (None).
+    """
+    same = [read for read in reads if len(read) == len(fallback)]
+    if len(same) < 3:
+        return None if strict else fallback
+    voted = []
+    for position, current in enumerate(fallback):
+        counts = Counter(read[position] for read in same)
+        best = max(counts.values())
+        leaders = sorted(c for c, n in counts.items() if n == best)
+        if len(leaders) > 1 and strict:
+            return None
+        voted.append(current if counts[current] == best else leaders[0])
+    return "".join(voted)
+
+
 def similar(first: str, second: str) -> bool:
     return edit_distance(first, second) <= 1
 
@@ -113,6 +135,40 @@ def vehicle_crops_with_kinds(
             vehicle_kind(vehicle),
         ))
     return crops
+
+
+# Zona donde va la placa: la parte baja del vehículo (la trasera de carros y motos).
+ZONE_BOTTOM_FRACTION = 0.6
+ZONE_MIN_WIDTH = 640
+ZONE_SPLIT_WIDTH = 700
+ZONE_TILE_FRACTION = 0.6
+
+
+def plate_zones(image: np.ndarray) -> list[np.ndarray]:
+    """Recortes de la parte baja del vehículo donde la placa se ve más grande.
+
+    El detector de placas reduce la imagen a ~640 px; en un carro ancho (más de 1000 px)
+    la placa queda diminuta, y en una moto el vehículo entero sobra. Por eso se prueba: la
+    franja baja completa y, si es ancha, sus mitades izquierda y derecha (con solape), todas
+    ampliadas a un ancho mínimo.
+    """
+    height, width = image.shape[:2]
+    if height < 20 or width < 20:
+        return []
+    low = image[int(height * (1 - ZONE_BOTTOM_FRACTION)) :, :]
+    pieces = [low]
+    if width > ZONE_SPLIT_WIDTH:
+        tile = int(width * ZONE_TILE_FRACTION)
+        pieces += [low[:, :tile], low[:, width - tile :]]
+
+    zones = []
+    for piece in pieces:
+        piece_width = piece.shape[1]
+        if piece_width < ZONE_MIN_WIDTH:
+            scale = ZONE_MIN_WIDTH / piece_width
+            piece = cv2.resize(piece, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        zones.append(piece)
+    return zones
 
 
 def normalize_text(value: Any) -> str | None:
@@ -180,10 +236,13 @@ class PlateReader:
         local_detector: str = DEFAULT_LOCAL_DETECTOR,
         local_ocr: str = DEFAULT_LOCAL_OCR,
         local_engine: Any = None,
+        zone_retry: bool = False,
     ) -> None:
         if engine not in ENGINES:
             raise ValueError(f"Motor de placas desconocido: {engine!r} (usa {', '.join(ENGINES)})")
         self.engine = engine
+        # Si la lectura normal no da placa válida, se reintenta con la zona baja del vehículo.
+        self.zone_retry = zone_retry
         self.local = local_engine or LocalPlateEngine(local_detector, local_ocr)
         # Cuántas lecturas hizo cada motor: muestra cuántas llamadas a la API se ahorran.
         self.stats: Counter[str] = Counter()
@@ -365,6 +424,10 @@ class PlateReader:
             return self.read_texts(frame), "roboflow"
         local = self.local.read(frame)
         self.stats["local"] += 1
+        if self.zone_retry and not self.valid_plates(local.texts, kind):
+            zone_texts, zone = self.read_zones(frame, kind)
+            if zone:
+                return zone_texts, "local-zona"
         if (self.engine == "local" or not local.found or self.valid_plates(local.texts, kind)
                 or not self.roboflow_configured()):
             return local.texts, "local"
@@ -375,6 +438,21 @@ class PlateReader:
             return local.texts, "local"
         self.stats["roboflow"] += 1
         return texts, "roboflow"
+
+    def read_zones(self, image: np.ndarray, kind: str | None = None) -> tuple[list[str], int]:
+        """Lee las zonas del vehículo hasta dar con una placa válida.
+
+        Devuelve los textos leídos y el número (desde 1) de la zona que dio la placa válida,
+        o 0 si ninguna la dio (en ese caso los textos son todo lo que se leyó, sin validar).
+        """
+        texts: list[str] = []
+        for number, zone in enumerate(plate_zones(image), start=1):
+            self.stats["local_zona"] += 1
+            found = self.local.read(zone).texts
+            if self.valid_plates(found, kind):
+                return found, number
+            texts += found
+        return texts, 0
 
     def read_all(self, frame: np.ndarray, kind: str | None = None) -> list[str]:
         return self.valid_plates(self.read_candidates(frame, kind)[0], kind)
@@ -412,9 +490,18 @@ class PlateReader:
 
             ranked = sorted(counts, key=score, reverse=True)
             tied = len(ranked) > 1 and score(ranked[0]) == score(ranked[1])
-            if tied and len(group) < 2 * self.confirmation_reads + 1:
-                return None
             confirmed = ranked[0]
+            if tied and len(group) < 2 * self.confirmation_reads + 1:
+                # Empate entre lecturas completas: solo se confirma si, posición por posición,
+                # hay una mayoría clara; si no, se espera otra lectura.
+                decided = vote_characters(group, confirmed, strict=True)
+                if decided is None or (self.pattern is not None and not self.pattern.fullmatch(decided)):
+                    return None
+                self._forget(plate)
+                return decided, len(group)
+            voted = vote_characters(group, confirmed)
+            if voted != confirmed and (self.pattern is None or self.pattern.fullmatch(voted)):
+                confirmed = voted
             self._forget(plate)
             return confirmed, len(group)
 

@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 
 from app.state import RuntimeState
-from app.video_service import VideoService
+from app.video_service import SingleWorker, VideoService
 
 CAR = 2
 CAR_IN_CELL_1 = (CAR, 0.9, (30, 50, 70, 90))
@@ -41,7 +41,7 @@ def make_service(detector, detections=()) -> VideoService:
     service.overlay = None
     service.latest_frame = None
     service.latest_frame_id = 0
-    service.plate_thread = None
+    service.plate_worker = SingleWorker("plate-reader")
     service.vehicle_was_detected = True  # sin "recién llegó": no se lanza lectura de placas
     service.frame_number = 0
     service.detector_failed = False

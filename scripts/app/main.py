@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import re
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -17,6 +19,7 @@ from pydantic import BaseModel, Field
 
 from .calibration import Calibration, Row, Stall, calibrate, suggested_corners, top_down
 from .config import settings
+from .image_enhance import enhance_for_tracing
 from .video_service import VideoService
 from .vision_node import VisionNode
 
@@ -200,14 +203,48 @@ def _aligner(camera_id: int | None):
     return aligner
 
 
+# Cuadros originales de las imágenes que el editor pidió mejoradas, por cámara y número de cuadro.
+# Al guardar las celdas el editor envía la imagen mejorada que tiene en pantalla; con el número se
+# guarda como referencia el original, que es con lo que se compara cada cuadro del video.
+_RAW_FRAMES: OrderedDict[tuple[int, str], np.ndarray] = OrderedDict()
+_RAW_FRAMES_MAX = 16
+_FRAME_TOKEN = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+
+
+def _image_response(
+    camera: VideoService, frame: np.ndarray, mejorar: bool, cuadro: str | None, headers: dict[str, str] | None = None
+) -> Response:
+    """El cuadro en JPEG; con `mejorar`, más nítido para trazar, y se recuerda el original por `cuadro`."""
+    image = frame
+    if mejorar:
+        image = enhance_for_tracing(frame)
+        if cuadro and _FRAME_TOKEN.match(cuadro):
+            key = (id(camera), cuadro)
+            _RAW_FRAMES[key] = frame
+            _RAW_FRAMES.move_to_end(key)
+            while len(_RAW_FRAMES) > _RAW_FRAMES_MAX:
+                _RAW_FRAMES.popitem(last=False)
+    ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    if not ok:
+        raise HTTPException(status_code=500, detail="No se pudo codificar la imagen")
+    return Response(
+        content=encoded.tobytes(), media_type="image/jpeg", headers={"Cache-Control": "no-store", **(headers or {})}
+    )
+
+
 @app.post("/celdas/referencia")
 @app.post("/camaras/{camera_id}/celdas/referencia")
-async def cells_reference(request: Request, camera_id: int | None = None) -> dict[str, Any]:
+async def cells_reference(request: Request, camera_id: int | None = None, cuadro: str | None = None) -> dict[str, Any]:
     """El cuadro sobre el que se trazaron las celdas (JPEG), que el editor envía al guardarlas.
 
-    Con él se compensa el movimiento de la cámara: las celdas siguen a la imagen.
+    Con él se compensa el movimiento de la cámara: las celdas siguen a la imagen. Si el editor trazó
+    sobre una imagen mejorada, `cuadro` dice cuál y se guarda su original.
     """
     aligner = _aligner(camera_id)
+    raw = _RAW_FRAMES.get((id(_camera(camera_id)), cuadro)) if cuadro else None
+    if raw is not None:
+        aligner.set_reference(raw)
+        return {"referencia": "guardada", "ancho": raw.shape[1], "alto": raw.shape[0], "original": True}
     data = await request.body()
     image = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR) if data else None
     if image is None:
@@ -218,24 +255,24 @@ async def cells_reference(request: Request, camera_id: int | None = None) -> dic
 
 @app.get("/celdas/referencia")
 @app.get("/camaras/{camera_id}/celdas/referencia")
-def cells_reference_image(camera_id: int | None = None) -> Response:
+def cells_reference_image(camera_id: int | None = None, mejorar: bool = False, cuadro: str | None = None) -> Response:
     """El cuadro sobre el que se trazaron las celdas, para que el editor las muestre donde se trazaron.
 
     Con la cámara moviéndose, un cuadro actual queda corrido respecto de las celdas aunque
     la detección lo compense. La cabecera X-Referencia dice si la guardó el editor o se estimó.
+    Si la referencia es de otra escena (se cambió el video o la cámara se movió de sitio) responde
+    409: el editor traza entonces sobre la cámara en vivo.
     """
+    camera = _camera(camera_id)
     aligner = _aligner(camera_id)
-    image = aligner.reference_jpeg()
+    image = aligner.reference_frame()
     if image is None:
         raise HTTPException(status_code=404, detail="Todavía no hay imagen de referencia")
-    return Response(
-        content=image,
-        media_type="image/jpeg",
-        headers={
-            "Cache-Control": "no-store",
-            "X-Referencia": aligner.source,
-            "Access-Control-Expose-Headers": "X-Referencia",
-        },
+    current = camera.clean_frame()
+    if current is not None and aligner.matches(current) is False:
+        raise HTTPException(status_code=409, detail="La imagen del trazado ya no coincide con la cámara")
+    return _image_response(
+        camera, image, mejorar, cuadro, {"X-Referencia": aligner.source, "Access-Control-Expose-Headers": "X-Referencia"}
     )
 
 
@@ -295,22 +332,27 @@ def discard_cell_detection(camera_id: int | None = None) -> dict[str, Any]:
 
 @app.get("/celdas/deteccion/referencia")
 @app.get("/camaras/{camera_id}/celdas/deteccion/referencia")
-def cell_detection_reference(camera_id: int | None = None) -> Response:
+def cell_detection_reference(camera_id: int | None = None, mejorar: bool = False, cuadro: str | None = None) -> Response:
     """El cuadro al que están referidas las celdas propuestas, para trazar sobre la misma imagen."""
-    image = _camera(camera_id).cell_detection.reference_jpeg()
+    camera = _camera(camera_id)
+    image = camera.cell_detection.reference_frame()
     if image is None:
         raise HTTPException(status_code=404, detail="La detección todavía no tiene imagen")
-    return Response(content=image, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+    return _image_response(camera, image, mejorar, cuadro)
 
 
 @app.get("/snapshot")
 @app.get("/camaras/{camera_id}/snapshot")
-def snapshot(camera_id: int | None = None) -> Response:
-    """Cuadro actual sin dibujos (para trazar celdas desde la plataforma)."""
-    image = _camera(camera_id).snapshot_jpeg()
-    if image is None:
+def snapshot(camera_id: int | None = None, mejorar: bool = False, cuadro: str | None = None) -> Response:
+    """Cuadro actual sin dibujos (para trazar celdas desde la plataforma).
+
+    `mejorar`: más contraste y nitidez para ver las rayas del piso (solo para mostrar).
+    """
+    camera = _camera(camera_id)
+    frame = camera.clean_frame()
+    if frame is None:
         raise HTTPException(status_code=503, detail="Aún no hay imagen de la cámara")
-    return Response(content=image, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+    return _image_response(camera, frame, mejorar, cuadro)
 
 
 @app.post("/calibracion")

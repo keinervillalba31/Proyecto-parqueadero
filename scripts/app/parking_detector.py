@@ -40,17 +40,31 @@ class Vehicle:
 
 # Una caja que queda casi entera dentro de otra más grande es el mismo vehículo.
 _CONTAINED_RATIO = 0.7
+# Para dos cajas del cuadro completo (ver _drop_partial_boxes).
+_CONTAINED_RATIO_FULL_FRAME = 0.9
 
 
 def _drop_partial_boxes(
     detections: list[tuple[int, float, tuple[int, int, int, int]]],
+    from_crops: list[bool] | None = None,
 ) -> list[tuple[int, float, tuple[int, int, int, int]]]:
     """Quita las cajas parciales de un vehículo que ya tiene su caja completa.
 
     Cuando el borde de un recorte corta un carro, YOLO devuelve una caja con solo una parte;
     se superpone poco con la caja completa, así que el NMS la deja pasar y su punto de apoyo
     cae en el puesto vecino: el carro se cuenta dos veces.
+
+    `from_crops` dice qué cajas salieron de un recorte. A esas se les quita si quedan dentro de
+    otra en más de un 70 %. A las del cuadro completo se les exige un 90 %: en una fila vista en
+    perspectiva el carro de atrás queda en buena parte dentro de la caja del de adelante y es otro
+    vehículo, pero YOLO también da a veces una segunda caja, más chica, de la parte de arriba del
+    mismo carro. Medido en el video de Archivos, el 90 % quita esos duplicados (sin ellos, cero
+    falsos positivos en cuadros sueltos) y pierde 7 puestos de 258 en vez de 11 con el 70 %.
+    Sin `from_crops`, todas cuentan como de recorte.
     """
+    crop_box = {id(d): True for d in detections} if from_crops is None else {
+        id(d): crop for d, crop in zip(detections, from_crops)
+    }
     def area(box: tuple[int, int, int, int]) -> int:
         return max(0, box[2] - box[0]) * max(0, box[3] - box[1])
 
@@ -61,9 +75,48 @@ def _drop_partial_boxes(
 
     kept: list[tuple[int, float, tuple[int, int, int, int]]] = []
     for detection in sorted(detections, key=lambda item: area(item[2]), reverse=True):
-        if all(contained(detection[2], other[2]) <= _CONTAINED_RATIO for other in kept):
+        limit = _CONTAINED_RATIO if crop_box[id(detection)] else _CONTAINED_RATIO_FULL_FRAME
+        if all(contained(detection[2], other[2]) < limit for other in kept):
             kept.append(detection)
     return kept
+
+
+def _touches_border(box: tuple[int, int, int, int], width: int, height: int, margin: int = 4) -> bool:
+    x1, y1, x2, y2 = box
+    return x1 <= margin or y1 <= margin or x2 >= width - margin or y2 >= height - margin
+
+
+def far_cells(polygons: list[np.ndarray], relative_area: float = 0.4) -> list[int]:
+    """Índices de las celdas lejanas: las de menos de `relative_area` del área de la más grande."""
+    if not polygons:
+        return []
+    areas = [abs(cv2.contourArea(p.astype(np.float32))) for p in polygons]
+    largest = max(areas)
+    return [i for i, a in enumerate(areas) if 0 < a < largest * relative_area]
+
+
+def far_zone(
+    polygons: list[np.ndarray], width: int, height: int, relative_area: float = 0.4, min_zoom: float = 1.4,
+    image_size: int = 1280,
+) -> tuple[int, int, int, int] | None:
+    """Recuadro de las celdas lejanas, para analizarlo otra vez ampliado.
+
+    Lejanas son las celdas de menos de `relative_area` del área de la más grande: en la imagen
+    son tan chicas que una moto ocupa unos 15×20 px y el modelo no la ve. El recuadro sube por
+    encima de las celdas (los vehículos sobresalen hacia arriba) y solo vale la pena si YOLO lo
+    va a ampliar al menos `min_zoom` veces. None si no hay celdas lejanas (cámara cenital).
+    """
+    small = [polygons[i] for i in far_cells(polygons, relative_area)]
+    if not small:
+        return None
+    points = np.concatenate(small).astype(np.float32)
+    x0, y0 = points.min(axis=0)
+    x1, y1 = points.max(axis=0)
+    rise = (y1 - y0) * 0.6 + 20
+    box = (int(max(0, x0 - 20)), int(max(0, y0 - rise)), int(min(width, x1 + 20)), int(min(height, y1 + 10)))
+    if image_size / max(box[2] - box[0], box[3] - box[1], 1) < min_zoom:
+        return None
+    return box
 
 
 def best_device() -> str:
@@ -121,6 +174,8 @@ class VehicleDetector:
         self.tile_grid = max(tile_grid, 1)
         self.minimum_box_area = minimum_box_area
         self.minimum_motorcycle_area = minimum_motorcycle_area
+        # Zonas (x0, y0, x1, y1) que se analizan otra vez ampliadas: las celdas lejanas (ver far_zone).
+        self.zoom_zones: list[tuple[int, int, int, int]] = []
 
     def detect(self, frame: np.ndarray) -> list[Vehicle]:
         vehicles = []
@@ -138,20 +193,26 @@ class VehicleDetector:
     ) -> list[tuple[int, float, tuple[int, int, int, int]]]:
         height, width = frame.shape[:2]
         candidates: list[tuple[int, float, tuple[int, int, int, int]]] = []
+        from_crop: list[bool] = []
 
-        sources = [(frame, 0, 0)]
+        # (imagen, desplazamiento x, y, es recorte, descartar cajas que tocan su borde)
+        sources = [(frame, 0, 0, False, False)]
         if self.tile_grid > 1:
             tile_width = min(width, int(width / self.tile_grid * 1.35))
             tile_height = min(height, int(height / self.tile_grid * 1.35))
             x_starts = self._tile_starts(width, tile_width)
             y_starts = self._tile_starts(height, tile_height)
             sources.extend(
-                (frame[y : y + tile_height, x : x + tile_width], x, y)
+                (frame[y : y + tile_height, x : x + tile_width], x, y, True, False)
                 for y in y_starts
                 for x in x_starts
             )
+        # Las zonas ampliadas solo aportan lo que el cuadro completo no ve bien (vehículos chicos):
+        # un vehículo cortado por el borde de la zona ya lo detecta el cuadro completo.
+        sources.extend((frame[y0:y1, x0:x1], x0, y0, True, True) for x0, y0, x1, y1 in self.zoom_zones)
 
-        for source, offset_x, offset_y in sources:
+        for source, offset_x, offset_y, is_crop, skip_cut in sources:
+            source_height, source_width = source.shape[:2]
             result = self.model(
                 source,
                 conf=self.confidence,
@@ -163,6 +224,8 @@ class VehicleDetector:
                 if class_id not in VEHICLE_CLASSES:
                     continue
                 x1, y1, x2, y2 = map(int, detection.xyxy[0])
+                if skip_cut and _touches_border((x1, y1, x2, y2), source_width, source_height):
+                    continue
                 candidates.append(
                     (
                         class_id,
@@ -170,17 +233,20 @@ class VehicleDetector:
                         (x1 + offset_x, y1 + offset_y, x2 + offset_x, y2 + offset_y),
                     )
                 )
+                from_crop.append(is_crop)
 
         if not candidates:
             return []
         boxes = [[x1, y1, x2 - x1, y2 - y1] for _, _, (x1, y1, x2, y2) in candidates]
-        kept = cv2.dnn.NMSBoxes(
-            boxes,
-            [confidence for _, confidence, _ in candidates],
-            self.confidence,
-            0.45,
-        )
-        return _drop_partial_boxes([candidates[index] for index in np.array(kept).flatten()])
+        kept = np.array(
+            cv2.dnn.NMSBoxes(
+                boxes,
+                [confidence for _, confidence, _ in candidates],
+                self.confidence,
+                0.45,
+            )
+        ).flatten()
+        return _drop_partial_boxes([candidates[i] for i in kept], [from_crop[i] for i in kept])
 
     def _tile_starts(self, length: int, tile_length: int) -> list[int]:
         """Reparte `tile_grid` recortes solapados a lo largo de un eje."""
@@ -205,6 +271,10 @@ class ParkingDetector:
         clock: Callable[[], float] = time.monotonic,
         aligner: CellAligner | None = None,
         model: SharedModel | None = None,
+        zoom_far_cells: bool = False,
+        still_seconds: float = 0.0,
+        free_seconds_near: float | None = None,
+        footpoint_lift: float = 0.0,
     ) -> None:
         # Sin archivo de celdas locales (cámara de un nodo): empieza sin celdas y las trae la plataforma.
         parking_cells = {}
@@ -240,6 +310,25 @@ class ParkingDetector:
         self._clock = clock
         # Si se da, las celdas siguen a la imagen cuando la cámara se corre.
         self.aligner = aligner
+        # Analizar otra vez, ampliada, la zona de las celdas lejanas (motos del fondo).
+        self.zoom_far_cells = zoom_far_cells
+        self._zoom_key: tuple[int, int, int] | None = None
+        # Contra falsos positivos:
+        # - Un vehículo solo ocupa un puesto si lleva `still_seconds` quieto (su punto de apoyo no
+        #   se mueve): el carro que pasa por el pasillo o el que maniobra no cuenta.
+        # - Las celdas cercanas, donde el detector casi no pierde los carros, se liberan tras
+        #   `free_seconds_near` (None: igual que las lejanas, `free_seconds`).
+        # - El punto de apoyo sube `footpoint_lift` de la altura de la caja: la caja incluye la
+        #   sombra y la defensa, y su borde de abajo cae en el puesto de adelante.
+        self.still_seconds = max(still_seconds, 0.0)
+        self.free_seconds_near = free_seconds_near
+        self.footpoint_lift = max(footpoint_lift, 0.0)
+        # Cuánto puede moverse el punto de apoyo (fracción del lado mayor de la caja) sin dejar
+        # de contar como quieto, y cuánto se recuerda un vehículo que el detector dejó de ver.
+        self.still_tolerance = 0.15
+        self.still_memory_seconds = 10.0
+        self._tracks: list[dict[str, Any]] = []
+        self._far_cell_names: set[str] = set()
         self.stable_occupied = {name: False for name in self.cells}
         # Desde cuándo una celda muestra lo contrario de su estado, sin interrupción.
         self.pending_since: dict[str, float | None] = {name: None for name in self.cells}
@@ -286,6 +375,76 @@ class ParkingDetector:
         self.cells = cells
         self._scaled_size = (width, height)
 
+    def _update_zoom_zone(self, width: int, height: int) -> None:
+        """Recalcula la zona ampliada cuando cambian las celdas o el tamaño del video."""
+        key = (width, height, id(self.cells))
+        if key == self._zoom_key:
+            return
+        self._zoom_key = key
+        names = list(self.cells)
+        self._far_cell_names = {
+            names[i] for i in far_cells([cell["points"] for cell in self.cells.values()])
+        }
+        zone = (
+            far_zone([cell["points"] for cell in self.cells.values()], width, height,
+                     image_size=self.vehicles.image_size)
+            if self.zoom_far_cells
+            else None
+        )
+        self.vehicles.zoom_zones = [zone] if zone else []
+
+    def _free_seconds_for(self, name: str) -> float:
+        if self.free_seconds_near is None or name in self._far_cell_names:
+            return self.free_seconds
+        return max(self.free_seconds_near, 0.0)
+
+    def footpoint_of(self, vehicle: Vehicle, to_reference: np.ndarray | None = None) -> Point:
+        """Punto de apoyo del vehículo en las coordenadas de las celdas (subido `footpoint_lift`)."""
+        x1, y1, x2, y2 = vehicle.box
+        x, y = (x1 + x2) / 2, y2 - (y2 - y1) * self.footpoint_lift
+        if to_reference is not None:
+            x, y = cv2.perspectiveTransform(np.float32([[[x, y]]]), to_reference)[0, 0]
+        return Point(float(x), float(y))
+
+    def cell_of(self, point: Point) -> str | None:
+        """La celda donde se apoya el punto; si cae en dos (bordes que se tocan), la de centro más cercano."""
+        covering = [name for name, cell in self.cells.items() if cell["polygon"].covers(point)]
+        if len(covering) <= 1:
+            return covering[0] if covering else None
+        return min(covering, key=lambda name: self.cells[name]["polygon"].centroid.distance(point))
+
+    def _still(self, vehicles: list[Vehicle], points: list[Point], now: float) -> list[bool]:
+        """Si cada vehículo lleva `still_seconds` quieto en el mismo lugar.
+
+        Sigue cada punto de apoyo de un análisis al siguiente. Un vehículo cuenta como quieto si
+        su punto se queda cerca de donde apareció (tolerancia según el tamaño de la caja, porque
+        la caja tiembla). La pista sobrevive unos segundos sin verlo: YOLO pierde a ratos los
+        vehículos lejanos y no por eso deben volver a empezar.
+        """
+        if self.still_seconds <= 0:
+            return [True] * len(vehicles)
+        memory = max(self.still_seconds, self.still_memory_seconds)
+        self._tracks = [t for t in self._tracks if now - t["seen"] <= memory]
+        free = set(range(len(self._tracks)))
+        result = []
+        for vehicle, point in zip(vehicles, points):
+            x1, y1, x2, y2 = vehicle.box
+            tolerance = 3.0 + self.still_tolerance * max(y2 - y1, x2 - x1)
+            best, best_distance = None, tolerance
+            for i in free:
+                distance = point.distance(self._tracks[i]["anchor"])
+                if distance <= best_distance:
+                    best, best_distance = i, distance
+            if best is None:
+                self._tracks.append({"anchor": point, "since": now, "seen": now})
+                result.append(False)
+                continue
+            free.discard(best)
+            track = self._tracks[best]
+            track["seen"] = now
+            result.append(now - track["since"] >= self.still_seconds)
+        return result
+
     def _smooth(self, raw_occupied: dict[str, bool]) -> dict[str, bool]:
         now = self._clock()
         for name, is_occupied in raw_occupied.items():
@@ -296,7 +455,7 @@ class ParkingDetector:
             started = self.pending_since[name]
             if started is None:
                 started = self.pending_since[name] = now
-            if now - started >= (self.occupy_seconds if is_occupied else self.free_seconds):
+            if now - started >= (self.occupy_seconds if is_occupied else self._free_seconds_for(name)):
                 self.stable_occupied[name] = is_occupied
                 self.pending_since[name] = None
         return dict(self.stable_occupied)
@@ -369,21 +528,13 @@ class ParkingDetector:
         reserved = reserved or {}
         height, width = frame.shape[:2]
         self._apply_cell_changes(width, height)
+        self._update_zoom_zone(width, height)
         occupied = {name: False for name in self.cells}
         vehicles = self.vehicles.detect(frame)
         # Las celdas están donde se trazaron: el punto de apoyo de cada vehículo se lleva allí.
         to_reference = self.aligner.transform(frame) if self.aligner is not None else None
 
-        for vehicle in vehicles:
-            foot = vehicle.footpoint
-            moved = foot
-            if to_reference is not None:
-                x, y = cv2.perspectiveTransform(np.float32([[[foot.x, foot.y]]]), to_reference)[0, 0]
-                moved = Point(float(x), float(y))
-            for name, cell in self.cells.items():
-                if cell["polygon"].covers(moved):
-                    occupied[name] = True
-                    vehicle.in_cell = True
+        occupied = self._decide(vehicles, to_reference)
 
         if self.aligner is not None:
             self.aligner.consider(frame, sum(occupied.values()))
@@ -421,6 +572,20 @@ class ParkingDetector:
             },
         }
         return state, vehicles
+
+    def _decide(self, vehicles: list[Vehicle], to_reference: np.ndarray | None) -> dict[str, bool]:
+        """Qué celdas tienen apoyado un vehículo quieto en este análisis (antes del suavizado)."""
+        occupied = {name: False for name in self.cells}
+        points = [self.footpoint_of(vehicle, to_reference) for vehicle in vehicles]
+        still = self._still(vehicles, points, self._clock())
+        for vehicle, point, is_still in zip(vehicles, points, still):
+            name = self.cell_of(point)
+            if name is None:
+                continue
+            vehicle.in_cell = True
+            if is_still:
+                occupied[name] = True
+        return occupied
 
     def first_free_space(self, state: dict[str, Any], reserved: set[str]) -> str | None:
         return next(

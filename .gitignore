@@ -19,3 +19,12 @@ videos/
 *.pt
 evaluacion/**/*.png
 evaluacion/**/*.jpg
+salida_placas_video/
+salida_comparacion_zona/
+salida_recortes_completos/
+salida_modelos_placas/
+*.log
+.env.respaldo*
+referencia_celdas.respaldo*
+entrenamiento/*/datos/
+entrenamiento/*/runs/

@@ -121,6 +121,11 @@ class CellDetection:
                 "propuesta": self.proposal,
             }
 
+    def reference_frame(self) -> np.ndarray | None:
+        """Copia del cuadro al que están referidas las celdas propuestas; None si todavía no hay."""
+        with self._lock:
+            return None if self.reference is None else self.reference.copy()
+
     def reference_jpeg(self) -> bytes | None:
         with self._lock:
             reference = self.reference
@@ -177,10 +182,17 @@ class CellDetection:
                     # Las celdas actuales se trazaron sobre su referencia: si existe, la propuesta
                     # queda en esas mismas coordenadas; si no, la referencia es el primer cuadro.
                     reference = self.reference_source()
+                    aligner = CellAligner()
+                    if reference is not None and reference.shape == frame.shape:
+                        aligner.set_reference(reference)
+                        if aligner.matches(frame) is False:
+                            # La referencia es de otra escena (se cambió el video o se movió la
+                            # cámara): la propuesta se calcularía sobre una imagen que ya no es.
+                            log.info("La referencia de las celdas no coincide con la cámara: se usa el cuadro actual")
+                            reference = None
                     if reference is None or reference.shape != frame.shape:
                         reference = frame.copy()
-                    aligner = CellAligner()
-                    aligner.set_reference(reference)
+                        aligner.set_reference(reference)
                     with self._lock:
                         if self._current(generation):
                             self.reference = reference

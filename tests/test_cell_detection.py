@@ -3,6 +3,7 @@
 import time
 from types import SimpleNamespace
 
+import cv2
 import numpy as np
 import pytest
 
@@ -104,6 +105,30 @@ def test_the_proposal_uses_the_reference_of_the_current_cells():
     while job.status()["cuadros"] == 0 and time.time() < deadline:
         time.sleep(0.02)
     assert np.array_equal(job.reference, reference)
+    job.discard()
+
+
+def test_a_reference_of_another_scene_is_not_used(monkeypatch):
+    """Se cambió el video o la cámara se movió de sitio: la propuesta va sobre el cuadro de ahora."""
+    def textured(seed):
+        noise = np.random.default_rng(seed).integers(0, 255, (HEIGHT // 6, WIDTH // 6), dtype=np.uint8)
+        gray = cv2.resize(noise, (WIDTH, HEIGHT), interpolation=cv2.INTER_CUBIC)
+        return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+    now, old = textured(1), textured(2)
+    model = FakeModel(scene_frames())
+    job = CellDetection(
+        frame_source=lambda: now,
+        reference_source=lambda: old,
+        model_path=cell_detection.Path("no-existe.pt"),
+        dwell_minutes=0.0,
+        model_factory=lambda: model,
+    )
+    job.start(minutes=10, every_seconds=0.01)
+    deadline = time.time() + 10
+    while job.status()["cuadros"] == 0 and time.time() < deadline:
+        time.sleep(0.02)
+    assert np.array_equal(job.reference_frame(), now)
     job.discard()
 
 
