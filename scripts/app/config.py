@@ -63,17 +63,33 @@ class Settings:
     # Segundos seguidos viendo un vehículo para dar un puesto por ocupado, y sin verlo para darlo por libre.
     occupancy_occupy_seconds: float = float(os.getenv("OCCUPANCY_OCCUPY_SECONDS", "2"))
     occupancy_free_seconds: float = float(os.getenv("OCCUPANCY_FREE_SECONDS", "8"))
+    # Contra falsos positivos (ver ParkingDetector y evaluacion/ocupacion/INFORME.md): segundos que un
+    # vehículo debe estar quieto para ocupar (0 = desactivado: en la evaluación perdía motos del fondo),
+    # segundos para liberar las celdas cercanas (vacío = OCCUPANCY_FREE_SECONDS; 8 con 30 en las lejanas)
+    # y cuánto se sube el punto de apoyo, en fracción de la altura de la caja (0,08 quitó 6 de 14 falsos
+    # positivos sin perder puestos).
+    occupancy_still_seconds: float = float(os.getenv("OCCUPANCY_STILL_SECONDS", "0"))
+    occupancy_free_seconds_near: float | None = (
+        float(os.environ["OCCUPANCY_FREE_SECONDS_NEAR"]) if os.getenv("OCCUPANCY_FREE_SECONDS_NEAR") else None
+    )
+    footpoint_lift: float = float(os.getenv("FOOTPOINT_LIFT", "0.08"))
     reservation_timeout_seconds: float = float(
         os.getenv("RESERVATION_TIMEOUT_SECONDS", "600")
     )
     minimum_box_area: int = int(os.getenv("MIN_BOX_AREA", "500"))
     minimum_motorcycle_area: int = int(os.getenv("MIN_MOTORCYCLE_AREA", "100"))
+    # true: la zona de las celdas lejanas (las de menos del 40 % del área de la más grande) se analiza
+    # otra vez ampliada. En la cámara de Archivos sube de 7 % a 33 % las motos del fondo detectadas en
+    # un cuadro, por ~0,1 s más de análisis. Sin celdas lejanas (cámara cenital) no hace nada.
+    zoom_far_cells: bool = os.getenv("ZOOM_FAR_CELLS", "true").strip().lower() in ("1", "true", "si", "sí", "yes")
     # Motor de lectura de placas: "local" (modelos abiertos, sin créditos), "roboflow" (API)
     # o "hibrido" (local y Roboflow solo cuando el local ve una placa y no la logra leer).
     plate_engine: str = os.getenv("PLATE_ENGINE", "local").strip().lower()
     plate_local_detector: str = os.getenv("PLATE_LOCAL_DETECTOR", DEFAULT_LOCAL_DETECTOR)
     plate_local_ocr: str = os.getenv("PLATE_LOCAL_OCR", DEFAULT_LOCAL_OCR)
     # Usar el tipo de vehículo de YOLO (carro o moto) para saber qué formato de placa esperar.
+    # Reintentar con la zona baja del vehículo cuando la lectura normal no encuentra placa.
+    plate_zone_retry: bool = os.getenv("PLATE_ZONE_RETRY", "false").lower() == "true"
     plate_use_vehicle_kind: bool = os.getenv("PLATE_USE_VEHICLE_KIND", "true").lower() == "true"
     plate_interval_frames: int = int(os.getenv("PLATE_INTERVAL_FRAMES", "15"))
     plate_confirmation_reads: int = int(os.getenv("PLATE_CONFIRMATION_READS", "2"))

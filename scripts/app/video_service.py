@@ -24,6 +24,62 @@ from .state import RuntimeState
 log = logging.getLogger("parqueadero")
 
 
+class SingleWorker:
+    """Un solo hilo que se reutiliza para correr un trabajo a la vez.
+
+    La lectura de placas corre YOLO (PyTorch). PyTorch arma un equipo de hilos OpenMP por
+    cada hilo que lo usa y no lo libera cuando ese hilo termina: con un hilo nuevo por lectura
+    (una por segundo) el servicio acumulaba ~8 hilos y ~5 MB por segundo hasta agotar la
+    memoria en unas horas. Con un hilo fijo el equipo se crea una sola vez.
+    """
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self._condition = threading.Condition()
+        self._job: tuple[Any, tuple[Any, ...]] | None = None
+        self._busy = False
+        self._thread: threading.Thread | None = None
+
+    @property
+    def busy(self) -> bool:
+        return self._busy
+
+    def submit(self, target: Any, *args: Any) -> bool:
+        """Corre `target(*args)` en el hilo; si ya está ocupado no hace nada y devuelve False."""
+        with self._condition:
+            if self._busy:
+                return False
+            self._busy = True
+            self._job = (target, args)
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self._loop, name=self.name, daemon=True)
+                self._thread.start()
+            self._condition.notify()
+        return True
+
+    def wait_idle(self, timeout: float = 5.0) -> bool:
+        """Espera a que termine el trabajo en curso (para las pruebas)."""
+        deadline = time.monotonic() + timeout
+        while self._busy and time.monotonic() < deadline:
+            time.sleep(0.005)
+        return not self._busy
+
+    def _loop(self) -> None:
+        while True:
+            with self._condition:
+                while self._job is None:
+                    self._condition.wait()
+                target, args = self._job
+                self._job = None
+            try:
+                target(*args)
+            except Exception:
+                log.exception("Falló el trabajo del hilo %s", self.name)
+            finally:
+                with self._condition:
+                    self._busy = False
+
+
 # Qué hace cada cámara: OCCUPANCY ve los puestos, ENTRY lee placas en una entrada y
 # MIXED hace las dos cosas (como la instalación de una sola cámara).
 ROLE_SPACES = {"OCCUPANCY", "MIXED"}
@@ -77,6 +133,10 @@ class VideoService:
             free_seconds=settings.occupancy_free_seconds,
             aligner=CellAligner(settings.cells_reference_path) if self.role in ROLE_SPACES else None,
             model=shared_model,
+            zoom_far_cells=getattr(settings, "zoom_far_cells", False),
+            still_seconds=getattr(settings, "occupancy_still_seconds", 0.0),
+            free_seconds_near=getattr(settings, "occupancy_free_seconds_near", None),
+            footpoint_lift=getattr(settings, "footpoint_lift", 0.0),
         )
         self.plates = PlateReader(
             workspace=settings.roboflow_workspace,
@@ -88,6 +148,7 @@ class VideoService:
             engine=settings.plate_engine,
             local_detector=settings.plate_local_detector,
             local_ocr=settings.plate_local_ocr,
+            zone_retry=settings.plate_zone_retry,
         )
         self.state = RuntimeState(self.parking.total_spaces)
         spaces, plates = self._load_services(settings.services_state_path)
@@ -103,7 +164,7 @@ class VideoService:
         # y el de placas, por eso tiene su propio candado.
         self.reservations: dict[str, dict[str, Any]] = {}
         self.reservations_lock = threading.Lock()
-        self.plate_thread: threading.Thread | None = None
+        self.plate_worker = SingleWorker("plate-reader")
         # placa -> hasta cuándo no se vuelve a consultar al backend por su primera lectura.
         self.first_read_checks: dict[str, float] = {}
         self.vehicle_was_detected = False
@@ -953,15 +1014,9 @@ class VideoService:
                 if (
                     self.plates_enabled
                     and frame_number % max(self.settings.plate_interval_frames, 1) == 0
-                    and (self.plate_thread is None or not self.plate_thread.is_alive())
+                    and not self.plate_worker.busy
                 ):
-                    self.plate_thread = threading.Thread(
-                        target=self._read_plate_video_frame,
-                        args=(frame.copy(),),
-                        name="plate-reader",
-                        daemon=True,
-                    )
-                    self.plate_thread.start()
+                    self.plate_worker.submit(self._read_plate_video_frame, frame.copy())
             except Exception as error:
                 self.state.update_source({"placas_error": str(error)})
                 log.exception("Falló el flujo de video de placas")
@@ -1075,15 +1130,15 @@ class VideoService:
             self.overlay = (vehicles, parking_state, reserved)
 
         vehicle_detected = parking_state["vehiculos_detectados"] > 0
-        if self.plates_enabled and not self.settings.plate_video_source and self._plate_attempt_allowed(vehicle_detected) and (
-            self.plate_thread is None or not self.plate_thread.is_alive()
+        if (
+            self.plates_enabled
+            and not self.settings.plate_video_source
+            and self._plate_attempt_allowed(vehicle_detected)
+            and not self.plate_worker.busy
         ):
             images = self._plate_images(frame)
             if images:
-                self.plate_thread = threading.Thread(
-                    target=self._read_plate, args=(images,), name="plate-reader", daemon=True
-                )
-                self.plate_thread.start()
+                self.plate_worker.submit(self._read_plate, images)
         self.vehicle_was_detected = vehicle_detected
 
         if self.spaces_enabled:

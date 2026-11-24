@@ -52,22 +52,26 @@ def test_services_default_to_on_without_a_saved_file(tmp_path):
 def test_plates_off_does_not_start_a_plate_read(make_detector):
     service = make_service(make_detector(), detections=[CAR_IN_CELL_1])
     service.vehicle_was_detected = False  # el vehículo recién llegó: normalmente se leería
-    service._read_plate = lambda images: None
+    reads = []
+    service._read_plate = reads.append
     service.plates_enabled = False
 
     service._process_detection(blank_frame())
 
-    assert service.plate_thread is None
+    service.plate_worker.wait_idle()
+    assert reads == []
 
 
 def test_plates_on_starts_a_plate_read_when_a_vehicle_arrives(make_detector):
     service = make_service(make_detector(), detections=[CAR_IN_CELL_1])
     service.vehicle_was_detected = False
-    service._read_plate = lambda images: None
+    reads = []
+    service._read_plate = reads.append
 
     service._process_detection(blank_frame())
 
-    assert service.plate_thread is not None
+    service.plate_worker.wait_idle()
+    assert len(reads) == 1
 
 
 def test_spaces_off_keeps_the_last_occupancy_and_stops_reporting(make_detector):
@@ -88,3 +92,39 @@ def test_state_update_keeps_the_services_flags(make_detector):
     service.state.update({"celdas": {}})
 
     assert service.state.snapshot()["servicios"] == {"espacios": False, "placas": True}
+
+
+def test_plate_reads_reuse_one_thread():
+    # Un hilo nuevo por lectura dejaba vivos los hilos OpenMP de PyTorch (fuga de memoria).
+    import threading
+
+    from app.video_service import SingleWorker
+
+    worker, threads = SingleWorker("plate-reader"), set()
+    for _ in range(20):
+        assert worker.submit(lambda: threads.add(threading.get_ident()))
+        assert worker.wait_idle()
+    assert len(threads) == 1
+
+
+def test_a_busy_plate_worker_skips_new_reads():
+    import threading
+
+    from app.video_service import SingleWorker
+
+    worker, release = SingleWorker("plate-reader"), threading.Event()
+    assert worker.submit(release.wait)
+    assert worker.submit(lambda: None) is False
+    release.set()
+    assert worker.wait_idle()
+    assert worker.submit(lambda: None)
+
+
+def test_a_failing_read_does_not_kill_the_worker():
+    from app.video_service import SingleWorker
+
+    worker, done = SingleWorker("plate-reader"), []
+    worker.submit(lambda: 1 / 0)
+    assert worker.wait_idle()
+    worker.submit(lambda: done.append(True))
+    assert worker.wait_idle() and done == [True]
