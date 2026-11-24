@@ -104,6 +104,21 @@ def test_confirm_accepts_reads_that_differ_in_one_character():
     assert reader.confirm("BRF509") == ("BRF509", 3)
 
 
+def test_confirm_votes_character_by_character():
+    # Ninguna lectura completa se repite, pero cada posición tiene una mayoría clara.
+    reader = make_reader(confirmation_reads=3)
+    assert reader.confirm("BRF508") is None
+    assert reader.confirm("BRF519") is None
+    assert reader.confirm("BRF509") == ("BRF509", 3)
+
+
+def test_vote_keeps_the_most_repeated_read_when_a_position_ties():
+    from app.plate_reader import vote_characters
+
+    assert vote_characters(["ABC123", "ABC128", "ABC124"], "ABC123") == "ABC123"
+    assert vote_characters(["ABC123", "ABC128"], "ABC123") == "ABC123"  # menos de tres lecturas
+
+
 def test_confirm_tie_picks_the_most_central_read():
     reader = make_reader(confirmation_reads=3, plate_pattern="")
     reader.confirm("BRF50")
