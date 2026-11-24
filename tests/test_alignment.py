@@ -126,3 +126,25 @@ def test_without_reference_there_are_no_failures_to_report():
     aligner = CellAligner()
     aligner.transform(scene())
     assert aligner.health()["fallos_seguidos"] == 0
+
+
+def test_it_tells_whether_the_reference_is_still_the_same_scene():
+    aligner = CellAligner()
+    assert aligner.matches(scene()) is None
+    aligner.set_reference(scene())
+    assert aligner.matches(warp(scene(), moved_by(10, -6))) is True
+    # Se cambió el video o la cámara se movió de sitio: la referencia es de otra imagen.
+    assert aligner.matches(scene(seed=9)) is False
+    # Sin detalles (cámara tapada, negra) no se puede saber.
+    assert aligner.matches(np.zeros_like(scene())) is None
+    # Preguntar no cambia lo que se mide en el análisis.
+    assert aligner.last_transform is None and aligner.last_shift == (0.0, 0.0)
+
+
+def test_a_reference_with_more_contrast_still_fits_the_raw_frames():
+    from app.image_enhance import enhance_for_tracing
+
+    raw = scene()
+    aligner = CellAligner()
+    aligner.set_reference(enhance_for_tracing(cv2.addWeighted(raw, 0.5, np.full_like(raw, 128), 0.5, 0)))
+    assert aligner.matches(warp(cv2.addWeighted(raw, 0.5, np.full_like(raw, 128), 0.5, 0), moved_by(6, 4))) is True

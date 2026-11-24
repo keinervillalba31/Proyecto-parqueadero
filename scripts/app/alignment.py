@@ -32,11 +32,15 @@ _MIN_INLIERS = 40
 _MAX_SHIFT_RATIO = 0.1
 # Cuadros que se miran para estimar la referencia cuando no se guardó la del trazado.
 _ESTIMATION_FRAMES = 40
+_CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
 
 class _Features:
     def __init__(self, frame: np.ndarray) -> None:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+        # Contraste normalizado: así encajan un cuadro crudo y una referencia mejorada para trazar
+        # (image_enhance), y pesan menos los cambios de luz del día.
+        gray = _CLAHE.apply(cv2.GaussianBlur(gray, (0, 0), 1.0))
         height, width = gray.shape[:2]
         self.scale = width / _WORK_WIDTH
         small = cv2.resize(gray, (_WORK_WIDTH, max(1, round(height / self.scale))), interpolation=cv2.INTER_AREA)
@@ -151,25 +155,45 @@ class CellAligner:
             "fallos_seguidos": self.failures,
         }
 
+    def matches(self, frame: np.ndarray) -> bool | None:
+        """Si el cuadro se puede alinear con la referencia. No cambia nada.
+
+        Sirve para saber si la referencia sigue siendo de esta escena: al cambiar el video o mover la
+        cámara de sitio la referencia guardada queda de otra imagen y ya no encaja. None si no se
+        puede saber: no hay referencia, o una de las dos imágenes casi no tiene detalles (negra, tapada).
+        """
+        with self._lock:
+            reference = self._reference
+        if reference is None or reference.descriptors is None or len(reference.descriptors) < _MIN_INLIERS:
+            return None
+        current = _Features(frame)
+        if current.descriptors is None or len(current.descriptors) < _MIN_INLIERS:
+            return None
+        return self._homography(frame, reference, current) is not None
+
     def _transform(self, frame: np.ndarray) -> np.ndarray | None:
         with self._lock:
             reference = self._reference
-        if reference is None:
+        result = self._homography(frame, reference) if reference is not None else None
+        if result is None:
             self._reset()
             return None
-        current = _Features(frame)
+        self.last_transform, self.last_shift = result
+        return self.last_transform
+
+    def _homography(
+        self, frame: np.ndarray, reference: _Features, current: _Features | None = None
+    ) -> tuple[np.ndarray, tuple[float, float]] | None:
+        current = current or _Features(frame)
         if (current.descriptors is None or reference.descriptors is None or current.size != reference.size):
-            self._reset()
             return None
         matches = self._matcher.match(current.descriptors, reference.descriptors)
         if len(matches) < _MIN_INLIERS:
-            self._reset()
             return None
         source = np.float32([current.points[m.queryIdx].pt for m in matches])
         target = np.float32([reference.points[m.trainIdx].pt for m in matches])
         small, inliers = cv2.findHomography(source, target, cv2.RANSAC, 3.0)
         if small is None or inliers is None or int(inliers.sum()) < _MIN_INLIERS:
-            self._reset()
             return None
         # Se calculó a tamaño reducido: se pasa a píxeles del cuadro.
         scale = np.diag([current.scale, current.scale, 1.0])
@@ -178,8 +202,5 @@ class CellAligner:
         center = cv2.perspectiveTransform(np.float32([[[width / 2, height / 2]]]), full)[0, 0]
         shift = (float(width / 2 - center[0]), float(height / 2 - center[1]))
         if not np.isfinite(full).all() or np.hypot(*shift) > _MAX_SHIFT_RATIO * width:
-            self._reset()
             return None
-        self.last_transform = full
-        self.last_shift = shift
-        return full
+        return full, shift
